@@ -192,3 +192,84 @@ def test_copy():
     np.testing.assert_array_equal(x.getWeights(), x2.getWeights())
     np.testing.assert_array_equal(x.getBins(), x2.getBins())    
 
+
+
+def test_quantile_monotonic():
+    """Tests that quantile() is non-decreasing in p and stays within the support."""
+    std = 100
+    mu  = 100
+    np.random.seed(31337)
+    data = np.random.randn(10_000)*std + mu
+    x = mc.Digest(maxBins=32)
+    for d in data:
+        x.add(d)
+
+    ps = np.linspace(0.001, 0.999, 2000)
+    qs = [x.quantile(p) for p in ps]
+
+    for p, q in zip(ps, qs):
+        assert x.lower() <= q <= x.upper(), \
+            f'quantile({p}) = {q} outside [{x.lower()}, {x.upper()}]'
+
+    for i in range(len(ps) - 1):
+        assert qs[i+1] >= qs[i], \
+            f'quantile decreased between p={ps[i]} ({qs[i]}) and p={ps[i+1]} ({qs[i+1]})'
+
+
+def test_quantile_covers_total_weight():
+    """Tests that quantile()'s weight gaps add up to the total weight of the digest.
+
+    quantile() walks a ladder of weight gaps between adjacent centroids. If any
+    gap is under-weighted the ladder stops short of the total weight, and every p
+    past that point falls out of the loop and returns upper() instead of
+    interpolating. Rather than re-deriving the ladder here, we assert the
+    observable consequence: the loop only runs out at p == 1, so for any p below
+    that the result has to be strictly inside the support.
+    """
+    std = 100
+    mu  = 100
+    np.random.seed(31337)
+    data = np.random.randn(10_000)*std + mu
+    x = mc.Digest(maxBins=32)
+    for d in data:
+        x.add(d)
+
+    for p in [0.5, 0.9, 0.99, 0.999, 0.99999]:
+        assert x.quantile(p) < x.upper(), f'quantile({p}) clamped to upper()'
+
+
+def test_quantile_heavy_last_centroid():
+    """Tests interpolation into a final centroid carrying most of the weight.
+
+    The shortfall in the ladder is half of the last centroid's weight, so it is
+    nearly invisible while that centroid is a singleton. Here 1000 of 1010 points
+    sit on the top centroid, which puts the shortfall at half the range.
+    """
+    x = mc.Digest(maxBins=16)
+    for v in range(1, 11):
+        x.add(float(v))
+    for _ in range(1000):
+        x.add(100.0)
+
+    assert x.getActiveBinCount() == 11
+    assert x.getWeights()[-1] == 1000
+
+    for p in [0.6, 0.75, 0.9, 0.99]:
+        assert x.quantile(p) < x.upper(), f'quantile({p}) clamped to upper()'
+
+
+def test_quantile_two_centroids():
+    """Tests the degenerate digest whose only segment is both the first and the last.
+
+    Both centroids have to contribute their full weight to the single gap,
+    otherwise the ladder covers less than the total weight.
+    """
+    x = mc.Digest(maxBins=16)
+    x.add(1.0)
+    x.add(5.0, 9.0)
+
+    assert x.getActiveBinCount() == 2
+    assert sum(x.getWeights()) == 10
+
+    assert x.quantile(0.5) > x.lower()
+    assert x.quantile(0.99) < x.upper()
