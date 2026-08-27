@@ -459,12 +459,21 @@ class RanVar():
             w_ = p*W
 
             for i in range(self.nActive-1):
+                # Segment i spans centroids i and i+1, so the last segment is
+                # nActive-2, not nActive-1. An outer centroid contributes its
+                # full weight to its only segment, an interior one half to each
+                # side; that is what makes the gaps sum to W. The two ends are
+                # tested separately so this still holds when there are only two
+                # centroids and segment 0 is both the first and the last.
                 if i == 0:
-                    wGap = m[i] + m[i+1]/2
-                elif i == self.nActive - 1:
-                    wGap = m[i]/2 + m[i+1]
+                    wGap = m[i]
                 else:
-                    wGap = m[i]/2 + m[i+1]/2
+                    wGap = m[i]/2
+
+                if i == self.nActive - 2:
+                    wGap = wGap + m[i+1]
+                else:
+                    wGap = wGap + m[i+1]/2
 
                 wi_n = wi + wGap
 
