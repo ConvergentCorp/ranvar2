@@ -1,0 +1,17 @@
+# Cython / setuptools build output
+*.c
+*.so
+*.html
+build/
+*.egg-info/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Editor backups
+*~
+
+# Virtualenv
+.venv/
+.pytest_cache/
