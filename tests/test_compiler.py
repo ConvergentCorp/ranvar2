@@ -1,10 +1,13 @@
+import cython
+import math
+
 import ranvar as mc
 import numpy as np
 import pytest
 
 
 def makeSource(mean=100.0, spread=10.0, seed=31337):
-    """Build a digest to draw from in a compiled model."""
+    """Build a digest for a compiled model to draw from."""
     np.random.seed(seed)
     x = mc.Digest(maxBins=64)
     for d in np.random.randn(5_000)*spread + mean:
@@ -17,138 +20,109 @@ other  = makeSource(mean=20.0, spread=5.0, seed=99)
 rate   = 0.05
 
 
-# Compiling is slow enough that the models are shared across the tests that only
-# need to look at a compiled result.
+# Models are written once and shared, since each distinct one costs a compile.
 
-@mc.cfunc(samples=2_000)
-def difference():
-    return ~source - ~other
+def difference(revenue: mc.RanVar, cost: mc.RanVar) -> cython.double:
+    """A model with every type annotated."""
+    price: cython.double = ~revenue
+    spend: cython.double = ~cost
+    return price - spend
 
 
-@mc.cfunc(samples=2_000)
-def pair():
-    p = ~source
-    return p, p - ~other
+def pair(a: mc.RanVar, b: mc.RanVar):
+    """A model returning two values, so it has no scalar return type."""
+    first: cython.double = ~a
+    return first, first - ~b
+
+
+compiled = mc.cfunc(difference, samples=2_000)
+compiledPair = mc.cfunc(pair, samples=2_000)
 
 
 def test_returns_a_ranvar():
     """Tests that a compiled model collects into a RanVar like func does."""
-    assert isinstance(difference(), mc.RanVar)
+    assert isinstance(compiled(source, other), mc.RanVar)
 
 
 def test_matches_the_interpreted_executor():
     """Tests that compiling a model does not change what it computes.
 
-    The C loop and the Python one draw from the same generator, so seeding both
-    the same way has to give the same simulation, not merely a similar one.
+    The same function is run both ways, so seeding them alike has to give the
+    same simulation rather than merely a similar one.
     """
-    @mc.func(samples=2_000)
-    def interpreted():
-        return ~source - ~other
+    interpreted = mc.func(difference, samples=2_000)
 
     mc.seed(4321)
-    compiled = difference()
+    fast = compiled(source, other)
 
     mc.seed(4321)
-    plain = interpreted()
+    plain = interpreted(source, other)
 
-    assert compiled.mean() == plain.mean()
-    np.testing.assert_array_equal(compiled.getBins(), plain.getBins())
-    np.testing.assert_array_equal(compiled.getWeights(), plain.getWeights())
+    assert fast.mean() == plain.mean()
+    np.testing.assert_array_equal(fast.getBins(), plain.getBins())
+    np.testing.assert_array_equal(fast.getWeights(), plain.getWeights())
 
 
 def test_compilation_is_lazy_and_cached():
     """Tests that the model compiles on first use and not at decoration."""
 
-    @mc.cfunc(samples=10)
-    def model():
-        return ~source
+    def model(x: mc.RanVar) -> cython.double:
+        return ~x
 
-    assert model.module is None, 'decorating the model already compiled it'
+    wrapped = mc.cfunc(model, samples=10)
 
-    model()
+    assert wrapped.module is None, 'decorating the model already compiled it'
 
-    assert model.module is not None
+    wrapped(source)
 
-    compiled = model.module
-    model()
+    assert wrapped.module is not None
 
-    assert model.module is compiled, 'the model was compiled a second time'
+    built = wrapped.module
+    wrapped(source)
+
+    assert wrapped.module is built, 'the model was compiled a second time'
 
 
 def test_sample_count():
     """Tests that a compiled model runs the requested number of samples."""
+    assert sum(compiled(source, other).getWeights()) == 2_000
 
-    @mc.cfunc(samples=250)
-    def model():
-        return ~source
+    smaller = compiled.withSamples(70)
 
-    assert sum(model().getWeights()) == 250
-    assert sum(model.withSamples(70)().getWeights()) == 70
-    assert model.samples == 250
-
-
-def test_withSamples_shares_the_compiled_module():
-    """Tests that overriding the sample count does not compile the model again."""
-    difference()
-
-    smaller = difference.withSamples(50)
-
-    assert smaller.module is difference.module
-    assert sum(smaller().getWeights()) == 50
+    assert sum(smaller(source, other).getWeights()) == 70
+    assert smaller.module is compiled.module, 'the override recompiled the model'
+    assert compiled.samples == 2_000
 
 
 def test_maxBins_is_honoured():
     """Tests that the returned digest is built with the requested resolution."""
+    coarse = mc.cfunc(difference, samples=2_000, maxBins=16)
 
-    @mc.cfunc(samples=2_000, maxBins=16)
-    def model():
-        return ~source
-
-    assert model().getActiveBinCount() == 16
+    assert coarse(source, other).getActiveBinCount() == 16
 
 
-def test_arguments_reach_the_model():
-    """Tests that a compiled model can take numbers from the call."""
+def test_numeric_arguments():
+    """Tests that a compiled model can take plain numbers alongside digests."""
 
-    @mc.cfunc(samples=500)
-    def scaled(factor, offset=1.0):
-        return ~source * factor + offset
+    def scaled(x: mc.RanVar, factor: cython.double) -> cython.double:
+        return ~x * factor
 
-    doubled = scaled(2.0)
-    shifted = scaled(1.0, offset=100.0)
-    plain   = scaled(1.0, offset=0.0)
+    wrapped = mc.cfunc(scaled, samples=500)
 
-    assert abs(doubled.mean() - 2*plain.mean()) < 1e-6 * abs(plain.mean()) + 1.0
-    assert abs((shifted.mean() - plain.mean()) - 100.0) < 1.0
+    # Seeded alike, both runs draw the same values, so the factor comes through
+    # exactly rather than only on average.
+    mc.seed(11)
+    single = wrapped(source, 1.0)
 
+    mc.seed(11)
+    double = wrapped(source, 2.0)
 
-def test_free_variables_are_reread_each_call():
-    """Tests that rebinding a number the model reads is seen by the next call.
-
-    The free names are passed into the compiled loop as arguments rather than
-    burned in when it was built, so the model keeps Python's scoping.
-    """
-    global rate
-
-    @mc.cfunc(samples=500)
-    def model():
-        return ~source * rate
-
-    before = model().mean()
-
-    rate = 0.5
-    try:
-        after = model().mean()
-    finally:
-        rate = 0.05
-
-    assert abs(after / before - 10.0) < 0.5
+    assert double.mean() == pytest.approx(2*single.mean(), rel=1e-9)
 
 
 def test_multiple_outputs():
-    """Tests that a compiled model returning a tuple gives a RanVar each."""
-    out = pair()
+    """Tests that a model returning a tuple gives a RanVar for each value."""
+    out = compiledPair(source, other)
 
     assert isinstance(out, tuple)
     assert len(out) == 2
@@ -159,127 +133,142 @@ def test_multiple_outputs():
     assert abs((first.mean() - second.mean()) - other.mean()) < 1.0
 
 
-def test_branches_are_compiled():
-    """Tests that if and else are translated rather than refused."""
+def test_module_names_are_carried_across():
+    """Tests that a model may use what its own module has imported.
 
-    @mc.cfunc(samples=2_000)
-    def clipped():
-        v = ~source
+    The generated module has a namespace of its own, so anything the model
+    reads from the module it was written in has to be put there.
+    """
 
-        if v > 100.0:
-            return 100.0
-        else:
-            return v
+    def usesModule(x: mc.RanVar) -> cython.double:
+        return math.sqrt(abs(~x)) * rate
 
-    out = clipped()
+    wrapped = mc.cfunc(usesModule, samples=500)
 
-    assert out.upper() <= 100.0
+    assert wrapped(source).mean() > 0.0
+
+
+def test_module_names_are_reread_each_call():
+    """Tests that rebinding a name the model reads is seen by the next call."""
+    global rate
+
+    def scaledByGlobal(x: mc.RanVar) -> cython.double:
+        return ~x * rate
+
+    wrapped = mc.cfunc(scaledByGlobal, samples=500)
+
+    before = wrapped(source).mean()
+
+    rate = 0.5
+    try:
+        after = wrapped(source).mean()
+    finally:
+        rate = 0.05
+
+    assert abs(after / before - 10.0) < 0.5
+
+
+def test_rejects_a_digest_read_from_the_module():
+    """Tests that drawing from a digest that is not a parameter is refused.
+
+    A module level name is a Python object to Cython whatever it holds, so such
+    a draw would compile but would not be a C call, which is the one thing cfunc
+    exists to guarantee.
+    """
+
+    def readsGlobal() -> cython.double:
+        return ~source
+
+    with pytest.raises(mc.RanVarCompileError):
+        mc.cfunc(readsGlobal).compile()
+
+
+def test_invert_is_only_rewritten_for_digests():
+    """Tests that ~ on an integer still means bitwise not.
+
+    A draw is rewritten to sample() because the invert slot cannot return a C
+    number. Only parameters annotated as digests are rewritten, so ~ keeps its
+    ordinary meaning everywhere else.
+    """
+
+    def bitwise(x: mc.RanVar) -> cython.double:
+        n: cython.int = 5
+        return float(~n) + ~x * 0.0
+
+    wrapped = mc.cfunc(bitwise, samples=50)
+
+    assert wrapped(source).mean() == float(~5)
+
+
+def test_ordinary_python_compiles():
+    """Tests that constructs with no C equivalent still compile and run.
+
+    The model's own source is what gets compiled, so anything Python allows is
+    allowed here; annotations decide how much of it becomes C rather than
+    whether it is accepted at all.
+    """
+
+    def withLoops(x: mc.RanVar) -> cython.double:
+        total: cython.double = 0.0
+
+        for _ in range(3):
+            total += ~x
+
+        while total < 400.0:
+            total += 1.0
+
+        return total
+
+    def withCall(x: mc.RanVar) -> cython.double:
+        return math.sqrt(abs(~x))
+
+    def withComprehension(x: mc.RanVar) -> cython.double:
+        return float(sum([x.sample() for _ in range(3)]))
+
+    def withTry(x: mc.RanVar) -> cython.double:
+        try:
+            return ~x
+        except ZeroDivisionError:
+            return 0.0
+
+    for model in [withLoops, withCall, withComprehension, withTry]:
+        out = mc.cfunc(model, samples=200)(source)
+
+        assert isinstance(out, mc.RanVar), f'{model.__name__} did not run'
 
 
 def test_errors_from_the_digest_propagate():
-    """Tests that an exception raised inside the C loop is not swallowed.
-
-    The loop runs in C, where an error has to be checked for and passed back
-    rather than simply travelling up the Python stack on its own.
-    """
+    """Tests that an exception raised inside the C loop is not swallowed."""
     empty = mc.Digest(maxBins=8)
 
-    @mc.cfunc(samples=100)
-    def model():
-        return ~empty
+    def model(x: mc.RanVar) -> cython.double:
+        return ~x
+
+    wrapped = mc.cfunc(model, samples=100)
 
     with pytest.raises(ValueError):
-        model()
+        wrapped(empty)
 
 
-def test_rejects_unsupported_models():
-    """Tests that anything outside the compilable subset is refused outright.
+def test_rejects_a_signature_the_driver_cannot_mirror():
+    """Tests that a model taking *args or **kwargs is refused."""
 
-    cfunc exists to keep the loop out of the interpreter, so falling back to it
-    quietly would leave a model looking fast and running slow.
-    """
-    import math
+    def starred(x: mc.RanVar, *rest) -> cython.double:
+        return ~x
 
-    text = 'not a number'
-    things = [1.0, 2.0, 3.0]
+    def keyworded(x: mc.RanVar, **rest) -> cython.double:
+        return ~x
 
-    def callsAFunction():
-        return math.sqrt(~source)
-
-    def usesAString():
-        return ~source + text
-
-    def neverReturns():
-        value = ~source
-
-    def returnsNothing():
-        return
-
-    def branchesWithoutElse():
-        if ~source > 1.0:
-            return 1.0
-
-    def disagreesOnWidth():
-        if ~source > 1.0:
-            return 1.0, 2.0
-        return 3.0
-
-    def chainsAComparison():
-        return 1.0 if 0.0 < ~source < 5.0 else 2.0
-
-    def usesAReservedName():
-        _rv_value = ~source
-        return _rv_value
-
-    def usesFloorDivision():
-        return ~source // 2.0
-
-    def unpacksATuple():
-        first, second = 1.0, 2.0
-        return first + second
-
-    def readsAnUndefinedName():
-        return ~source + missing
-
-    def loopsOverAList():
-        total = 0.0
-        for value in things:
-            total += value
-        return total
-
-    def loopsOverTwoNames():
-        total = 0.0
-        for first, second in range(3):
-            total += first
-        return total
-
-    def loopWithElse():
-        total = 0.0
-        for _ in range(3):
-            total += ~source
-        else:
-            total += 1.0
-        return total
-
-    models = [
-        callsAFunction, usesAString, neverReturns,
-        returnsNothing, branchesWithoutElse, disagreesOnWidth,
-        chainsAComparison, usesAReservedName, usesFloorDivision,
-        unpacksATuple, readsAnUndefinedName,
-        loopsOverAList, loopsOverTwoNames, loopWithElse,
-    ]
-
-    for model in models:
+    for model in [starred, keyworded]:
         with pytest.raises(mc.RanVarCompileError):
             mc.cfunc(model).compile()
 
 
-def test_rejects_drawing_from_a_non_ranvar():
-    """Tests that ~ is refused on anything that is not a RanVar."""
-    number = 3.0
+def test_rejects_a_reserved_parameter_name():
+    """Tests that a parameter the generated module would shadow is refused."""
 
-    def model():
-        return ~number
+    def model(_rv_out: mc.RanVar) -> cython.double:
+        return ~_rv_out
 
     with pytest.raises(mc.RanVarCompileError):
         mc.cfunc(model).compile()
@@ -306,143 +295,10 @@ def test_metadata_is_preserved():
     """Tests that the wrapper keeps the identity of the model it wraps."""
 
     @mc.cfunc
-    def documented():
+    def documented(x: mc.RanVar) -> cython.double:
         """A documented model."""
-        return ~source
+        return ~x
 
     assert documented.__name__ == 'documented'
     assert documented.__doc__ == 'A documented model.'
     assert documented.__wrapped__.__name__ == 'documented'
-
-
-def test_for_loop_is_compiled():
-    """Tests that a for loop over range is translated rather than refused."""
-    count = 4
-
-    @mc.cfunc(samples=1_000)
-    def summed():
-        total = 0.0
-
-        for i in range(count):
-            total += ~source
-
-        return total
-
-    @mc.func(samples=1_000)
-    def interpreted():
-        total = 0.0
-
-        for i in range(count):
-            total += ~source
-
-        return total
-
-    mc.seed(2468)
-    compiled = summed()
-
-    mc.seed(2468)
-    plain = interpreted()
-
-    assert compiled.mean() == plain.mean()
-    np.testing.assert_array_equal(compiled.getWeights(), plain.getWeights())
-
-
-def test_loop_counter_is_usable_as_a_number():
-    """Tests that the loop variable can be used in the model's arithmetic.
-
-    Counters are integers where everything else in a compiled model is a
-    double, so using one in an expression has to still give the right answer.
-    """
-
-    @mc.cfunc(samples=200)
-    def weighted():
-        total = 0.0
-
-        for i in range(4):
-            total += i * 2.0
-
-        return total
-
-    # 2*(0 + 1 + 2 + 3) is 12 on every run, so the digest holds one value.
-    assert weighted().mean() == 12.0
-
-
-def test_while_loop_is_compiled():
-    """Tests that a while loop is translated rather than refused."""
-
-    @mc.cfunc(samples=1_000)
-    def accumulate():
-        total = 0.0
-
-        while total < 300.0:
-            total += ~source
-
-        return total
-
-    @mc.func(samples=1_000)
-    def interpreted():
-        total = 0.0
-
-        while total < 300.0:
-            total += ~source
-
-        return total
-
-    mc.seed(1357)
-    compiled = accumulate()
-
-    mc.seed(1357)
-    plain = interpreted()
-
-    assert compiled.lower() >= 300.0
-    assert compiled.mean() == plain.mean()
-    np.testing.assert_array_equal(compiled.getWeights(), plain.getWeights())
-
-
-def test_break_and_continue_are_compiled():
-    """Tests that break and continue work inside a compiled loop."""
-
-    @mc.cfunc(samples=500)
-    def counted():
-        total = 0.0
-        seen = 0.0
-
-        for i in range(10):
-            if i < 2.0:
-                continue
-
-            if i > 5.0:
-                break
-
-            total += 1.0
-
-        return total
-
-    # i runs 2, 3, 4, 5 before the break, whatever the draws do.
-    assert counted().mean() == 4.0
-
-
-def test_elif_and_nested_ifs_are_compiled():
-    """Tests that an elif chain and a nested if both translate.
-
-    Python represents elif as an if nested in the else of the one before, so
-    this leans on the same translation as a plain else.
-    """
-
-    @mc.cfunc(samples=2_000)
-    def banded():
-        value = ~source
-
-        if value > 110.0:
-            band = 3.0
-        elif value > 100.0:
-            band = 2.0
-        else:
-            band = 1.0
-
-        return band
-
-    out = banded()
-
-    assert out.lower() >= 1.0
-    assert out.upper() <= 3.0

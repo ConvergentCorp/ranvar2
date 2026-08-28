@@ -5,8 +5,10 @@ import importlib.machinery
 import importlib.util
 import inspect
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import textwrap
 
 from ranvar.decorators import DEFAULT_MAXBINS, DEFAULT_SAMPLES, _checkSamples
@@ -14,262 +16,201 @@ from ranvar.ranvar import RanVar
 
 
 class RanVarCompileError(Exception):
-    """Raised when a function cannot be compiled into a C simulation.
-
-    cfunc refuses anything it cannot turn into C rather than quietly running it
-    through the interpreter, so that a model either has the performance the
-    decorator promises or says why it does not.
-    """
+    """Raised when a model cannot be compiled into a C simulation."""
 
 
-# The generated module names its own machinery with this prefix. A model using
-# a name of its own that starts with it would be shadowed, so they are refused.
+# The generated module names its own machinery with this prefix, so a model
+# using a name of its own that starts with it would be shadowed.
 RESERVED = '_rv_'
 
-# The arithmetic the generated C understands. Floor division and modulo are left
-# out because their meaning for negative operands differs between Python and the
-# C the generated module compiles to.
-BINOPS = {
-    ast.Add: '+',
-    ast.Sub: '-',
-    ast.Mult: '*',
-    ast.Div: '/',
-    ast.Pow: '**',
-}
+# Return annotations that mean the model hands back a C number rather than a
+# Python object, and so returns exactly one value.
+# Distinguishes a name bound to None from one that is not bound at all.
+MISSING = object()
 
-# How many turns of a compiled while loop pass between checks for a pending
-# signal. Small enough that Ctrl-C feels immediate, large enough not to matter.
-SIGNAL_EVERY = 4096
-
-COMPARES = {
-    ast.Lt: '<',
-    ast.LtE: '<=',
-    ast.Gt: '>',
-    ast.GtE: '>=',
-    ast.Eq: '==',
-    ast.NotEq: '!=',
+SCALARS = {
+    'cython.double', 'cython.float', 'cython.int', 'cython.long',
+    'cython.longlong', 'cython.size_t', 'cython.Py_ssize_t',
+    'double', 'float', 'int',
 }
 
 
-class Translator():
-    """Turns a model function into the source of a Cython module.
+class Model():
+    """A function prepared for compilation.
 
-    The result is a module holding the model body as a cdef function over C
-    doubles and a driver that loops over it, so that once it is called nothing
-    in the simulation goes back through the interpreter.
+    The model's own source is what gets compiled, in Cython's pure Python mode,
+    so its types come from ordinary annotations rather than from anything this
+    module works out. A parameter annotated as a RanVar is reached through the
+    extension type's method table rather than through Python, which is what
+    makes a draw a C call.
 
-    Names the model reads but does not define are resolved at compile time to
-    decide what they are, and passed into the loop as arguments at call time so
-    that rebinding one is still seen.
+    The single thing not carried over verbatim is ~. The invert slot is defined
+    to return a Python object, so ~a boxes a float however the argument is
+    annotated; a draw from a RanVar parameter is rewritten to a.sample(), which
+    does compile to a direct call.
 
     Attributes:
-        params (list): The model's own parameter names.
-        free (list): Names read from the enclosing scope, in argument order.
-        draws (set): Which of those names are RanVars and so can be drawn from.
-        counters (list): Loop variables, which are integers rather than doubles.
-        guards (int): How many while loops need a counter to pace signal checks.
-        width (int): How many values the model returns, 0 meaning a single one
-                   and None meaning no return has been seen yet.
+        name (str): The model's name.
+        params (list): The model's parameter names, in order.
+        digests (list): Which of those are annotated as RanVars.
+        globals (list): Names the model reads from its defining module.
+        scalar (bool): Whether the model is annotated as returning a C number.
+        source (str): The rewritten model, ready to paste into a module.
     """
 
     def __init__(self, fn):
-        """Prepare to translate a function.
+        """Prepare a function for compilation.
 
         Args:
-            fn (callable): The model to translate.
+            fn (callable): The model to compile.
+
+        Raises:
+            RanVarCompileError: If the model cannot be prepared.
         """
-        self.fn     = fn
-        self.name   = getattr(fn, '__name__', '<model>')
-        self.params = []
-        self.locals = []
-        self.free   = []
-        self.draws  = set()
-        self.width  = None
+        self.fn      = fn
+        self.name    = getattr(fn, '__name__', '<model>')
+        self.params  = []
+        self.digests = []
+        self.globals = []
 
-        # Loop counters are integers rather than doubles, and each while loop
-        # gets a counter of its own to pace its signal checks by.
-        self.counters = []
-        self.guards   = 0
-        self.ranges   = set()
+        node = self.parse()
 
-    # Analysis. ----------------------------------------------------------------
+        # A model annotated as returning a C number is collected by a loop that
+        # never boxes it, and cannot be returning several values. Without such
+        # an annotation the result is a Python object, which might be a tuple,
+        # so both loops are generated and the model is asked once which it is.
+        self.scalar = ast.unparse(node.returns) in SCALARS if node.returns else False
 
-    def fail(self, node, message):
+        self.signature(node)
+        self.scope(node)
+
+        node.decorator_list = []
+        node = Draws(self.digests).visit(node)
+
+        ast.fix_missing_locations(node)
+
+        self.source = ast.unparse(node)
+
+    def fail(self, message):
         """Report that the model cannot be compiled.
 
         Args:
-            node (ast.AST): The offending node, for its line number.
             message (str): What is wrong.
 
         Raises:
             RanVarCompileError: Always.
         """
-        line = getattr(node, 'lineno', None)
-        where = f' (line {line})' if line else ''
+        raise RanVarCompileError(f'{self.name}(): {message}')
 
-        raise RanVarCompileError(f'{self.name}(){where}: {message}')
-
-    def tree(self):
-        """Parse the model's source into the function definition node.
+    def parse(self):
+        """Parse the model's own source.
 
         Returns:
             ast.FunctionDef: The model's definition.
 
         Raises:
-            RanVarCompileError: If the source cannot be found or is not a plain
+            RanVarCompileError: If the source cannot be read or is not a plain
                               function definition.
         """
         try:
             source = inspect.getsource(self.fn)
         except (OSError, TypeError):
-            raise RanVarCompileError(
-                f'{self.name}(): cannot read the source of this function, so it '
-                f'cannot be compiled. cfunc needs a function defined in a file'
-            ) from None
+            self.fail(
+                'cannot read the source of this function, so it cannot be '
+                'compiled. cfunc needs a function defined in a file'
+            )
 
-        parsed = ast.parse(textwrap.dedent(source))
-        node   = parsed.body[0]
+        node = ast.parse(textwrap.dedent(source)).body[0]
 
         if not isinstance(node, ast.FunctionDef):
-            self.fail(node, 'only a plain function can be compiled')
+            self.fail('only a plain function can be compiled')
 
         return node
 
-    def collect(self, node):
-        """Work out the model's parameters, locals and free names.
+    def signature(self, node):
+        """Record the model's parameters and which of them are digests.
 
         Args:
             node (ast.FunctionDef): The model's definition.
 
         Raises:
-            RanVarCompileError: If the signature or a name is unusable.
+            RanVarCompileError: If the signature cannot be mirrored by the
+                              generated driver.
         """
         args = node.args
 
         if args.vararg is not None or args.kwarg is not None:
-            self.fail(node, '*args and **kwargs cannot be compiled')
+            self.fail('*args and **kwargs cannot be compiled')
 
         for arg in args.posonlyargs + args.args + args.kwonlyargs:
+            if arg.arg.startswith(RESERVED):
+                self.fail(f'{arg.arg!r} is reserved for the generated module')
+
             self.params.append(arg.arg)
 
-        # Only the body is scanned. The decorator list and the default values
-        # are part of the definition rather than of what runs, and naming a
-        # decorator would otherwise look like a free variable of the model.
-        for child in self.walk(node):
-            if isinstance(child, ast.For) and child.target.id not in self.counters:
-                self.counters.append(child.target.id)
+            if isRanVar(arg.annotation):
+                self.digests.append(arg.arg)
 
-        for child in self.walk(node):
-            if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store):
-                if child.id in self.params or child.id in self.counters:
-                    continue
+        self.annotations = {
+            arg.arg: ast.unparse(arg.annotation) if arg.annotation else None
+            for arg in args.posonlyargs + args.args + args.kwonlyargs
+        }
 
-                if child.id not in self.locals:
-                    self.locals.append(child.id)
+    def scope(self, node):
+        """Find the names the model reads from the module it was defined in.
 
-        for name in self.params + self.locals + self.counters:
-            if name.startswith(RESERVED):
-                self.fail(node, f'{name!r} is reserved for the generated module')
-
-        known = set(self.params) | set(self.locals) | set(self.counters)
-
-        # range is spelled like a name but is compiled as a loop, so it is not
-        # something to resolve from the surrounding scope.
-        skip = {id(child.func) for child in self.walk(node)
-                if isinstance(child, ast.Call) and id(child) in self.ranges}
-
-        for child in self.walk(node):
-            if not isinstance(child, ast.Name) or not isinstance(child.ctx, ast.Load):
-                continue
-
-            if child.id in known or child.id in self.free or id(child) in skip:
-                continue
-
-            self.free.append(child.id)
-
-    def structure(self, node):
-        """Reject unusable statements before any name is resolved.
-
-        Running first means a for loop is reported as a for loop, rather than as
-        whatever name it happens to mention on the way past.
+        Those are carried across into the generated module so that a model may
+        use whatever it likes. A digest read this way is refused, though: a
+        module level name is a Python object to Cython whatever it holds, so
+        drawing from one would silently be slow, which is the whole thing cfunc
+        exists to avoid.
 
         Args:
             node (ast.FunctionDef): The model's definition.
 
         Raises:
-            RanVarCompileError: If a statement or a call is outside the subset.
+            RanVarCompileError: If the model draws from a digest that is not a
+                              parameter.
         """
-        # range() in a for loop is the one call that is a construct rather than
-        # a function, so it is noted here and skipped by the ban below.
-        for child in self.walk(node):
-            if isinstance(child, ast.For) and self.isRange(child.iter):
-                self.ranges.add(id(child.iter))
+        assigned = set(self.params)
+        body     = list(self.body(node))
 
-        for statement in node.body:
-            self.statement(statement)
+        for child in body:
+            if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store):
+                assigned.add(child.id)
+            elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                assigned.add(child.name)
+            elif isinstance(child, ast.arg):
+                assigned.add(child.arg)
 
-        for child in self.walk(node):
-            if isinstance(child, ast.Call) and id(child) not in self.ranges:
-                self.fail(child, 'calling a function cannot be compiled')
+        for child in body:
+            if not isinstance(child, ast.Name) or not isinstance(child.ctx, ast.Load):
+                continue
 
-    def isRange(self, node):
-        """Report whether a node is a call to range().
+            if child.id in assigned or child.id in self.globals:
+                continue
 
-        Args:
-            node (ast.AST): The node to test.
+            if self.lookup(child.id) is MISSING:
+                continue
 
-        Returns:
-            bool: True for a range() call.
-        """
-        return (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == 'range'
-            and not node.keywords
-            and 1 <= len(node.args) <= 3
-        )
+            self.globals.append(child.id)
 
-    def statement(self, statement):
-        """Check one statement, and anything nested inside it, is compilable.
+        for name in self.globals:
+            if isinstance(self.lookup(name), RanVar):
+                self.fail(
+                    f'{name!r} is a RanVar read from the surrounding module. A '
+                    f'compiled model has to take its digests as parameters '
+                    f'annotated RanVar, so that drawing from them compiles to a '
+                    f'C call'
+                )
 
-        Args:
-            statement (ast.AST): The statement to check.
+    def body(self, node):
+        """Visit the model's statements, without their annotations.
 
-        Raises:
-            RanVarCompileError: If the statement is outside the subset.
-        """
-        if isinstance(statement, ast.If):
-            for child in statement.body + statement.orelse:
-                self.statement(child)
-
-            return
-
-        if isinstance(statement, (ast.For, ast.While)):
-            if statement.orelse:
-                self.fail(statement, 'the else clause of a loop cannot be compiled')
-
-            if isinstance(statement, ast.For):
-                if not self.isRange(statement.iter):
-                    self.fail(statement, 'a for loop can only run over range()')
-
-                if not isinstance(statement.target, ast.Name):
-                    self.fail(statement, 'a for loop can only bind a single name')
-
-            for child in statement.body:
-                self.statement(child)
-
-            return
-
-        allowed = (
-            ast.Expr, ast.Pass, ast.Assign, ast.AugAssign, ast.Return,
-            ast.Break, ast.Continue,
-        )
-
-        if not isinstance(statement, allowed):
-            self.fail(statement, f'{type(statement).__name__} cannot be compiled')
-
-    def walk(self, node):
-        """Visit every node in the model's body.
+        The decorator list and the signature are part of the definition rather
+        than of what runs, and an annotation names types the generated module
+        supplies itself, so a name used in one is not something the model reads
+        from its own module.
 
         Args:
             node (ast.FunctionDef): The model's definition.
@@ -277,20 +218,33 @@ class Translator():
         Yields:
             ast.AST: Each node under one of the body's statements.
         """
-        for statement in node.body:
-            yield from ast.walk(statement)
+        stack = list(node.body)
 
-    def resolve(self, name):
-        """Look a free name up in the scope the model was defined in.
+        while stack:
+            current = stack.pop()
+
+            yield current
+
+            annotation = getattr(current, 'annotation', None)
+
+            for child in ast.iter_child_nodes(current):
+                if annotation is not None and child is annotation:
+                    continue
+
+                stack.append(child)
+
+    def lookup(self, name):
+        """Look a name up in the scope the model was defined in.
+
+        Builtins are deliberately not searched: Cython resolves those itself,
+        and declaring one in the generated module would shadow it.
 
         Args:
             name (str): The name to resolve.
 
         Returns:
-            object: What the name is currently bound to.
-
-        Raises:
-            RanVarCompileError: If the name is not bound anywhere reachable.
+            object: What the name is bound to, or MISSING if it is not bound in
+                  the model's closure or module.
         """
         code = self.fn.__code__
 
@@ -300,489 +254,177 @@ class Translator():
             try:
                 return cell.cell_contents
             except ValueError:
-                raise RanVarCompileError(
-                    f'{self.name}(): {name!r} is not set yet'
-                ) from None
+                return MISSING
 
         if name in self.fn.__globals__:
             return self.fn.__globals__[name]
 
-        raise RanVarCompileError(
-            f'{self.name}(): {name!r} is not defined, so there is nothing to '
-            f'compile it as'
-        )
+        return MISSING
 
-    def classify(self):
-        """Decide what each free name is, so it can be given a C type.
+    def bindings(self):
+        """Collect the current values of the names the model reads.
 
-        Raises:
-            RanVarCompileError: If a name is neither a RanVar nor a number.
-        """
-        for name in self.free:
-            value = self.resolve(name)
-
-            if isinstance(value, RanVar):
-                self.draws.add(name)
-            elif isinstance(value, (int, float)) and not isinstance(value, bool):
-                pass
-            else:
-                raise RanVarCompileError(
-                    f'{self.name}(): {name!r} is a {type(value).__name__!r}; a '
-                    f'compiled model can only use RanVars and numbers from the '
-                    f'surrounding scope'
-                )
-
-    # Expressions. -------------------------------------------------------------
-
-    def expr(self, node):
-        """Translate an expression into C.
-
-        Args:
-            node (ast.AST): The expression node.
+        Read afresh rather than kept from compile time, so rebinding one between
+        calls is seen the way it would be in the interpreter.
 
         Returns:
-            str: The equivalent Cython expression.
-
-        Raises:
-            RanVarCompileError: If the expression is outside the subset.
+            dict: Name to value, for the names bound anywhere reachable.
         """
-        if isinstance(node, ast.Constant):
-            if isinstance(node.value, bool) or not isinstance(node.value, (int, float)):
-                self.fail(node, f'{node.value!r} is not a number')
+        found = {}
 
-            return repr(float(node.value))
+        for name in self.globals:
+            value = self.lookup(name)
 
-        if isinstance(node, ast.Name):
-            return node.id
+            if value is not MISSING:
+                found[name] = value
 
-        if isinstance(node, ast.BinOp):
-            op = BINOPS.get(type(node.op))
+        return found
 
-            if op is None:
-                self.fail(node, f'the {type(node.op).__name__} operator cannot be compiled')
+    def declaration(self, name):
+        """Render one parameter as the generated driver should declare it.
 
-            return f'({self.expr(node.left)} {op} {self.expr(node.right)})'
+        Args:
+            name (str): The parameter name.
 
-        if isinstance(node, ast.UnaryOp):
-            return self.unary(node)
+        Returns:
+            str: The parameter, with its annotation if the model gave one.
+        """
+        annotation = self.annotations.get(name)
 
-        if isinstance(node, ast.Compare):
-            if len(node.ops) != 1:
-                self.fail(node, 'a chained comparison cannot be compiled')
+        return f'{name}: {annotation}' if annotation else name
 
-            op = COMPARES.get(type(node.ops[0]))
+    def generate(self):
+        """Build the source of the module that runs this model.
 
-            if op is None:
-                self.fail(node, f'the {type(node.ops[0]).__name__} comparison cannot be compiled')
+        Returns:
+            str: The module source, for Cython's pure Python mode.
+        """
+        declared = [self.declaration(name) for name in self.params]
+        passed   = ', '.join(self.params)
+        comma    = ', ' if declared else ''
+        joined   = ', '.join(declared)
 
-            return f'({self.expr(node.left)} {op} {self.expr(node.comparators[0])})'
+        # Cython resolves module level names when it compiles, not when the
+        # module runs, so anything the model reads has to exist here even though
+        # the value is only put in place at call time.
+        declarations = ''.join(f'{name} = None\n' for name in self.globals)
 
-        if isinstance(node, ast.BoolOp):
-            joiner = ' and ' if isinstance(node.op, ast.And) else ' or '
+        source = MODULE.format(
+            name=self.name,
+            model=self.source,
+            declarations=declarations,
+            declared=joined,
+            passed=passed,
+            comma=comma,
+            prefix=RESERVED,
+        )
 
-            return '(' + joiner.join(self.expr(v) for v in node.values) + ')'
-
-        if isinstance(node, ast.IfExp):
-            return (
-                f'({self.expr(node.body)} if {self.expr(node.test)} '
-                f'else {self.expr(node.orelse)})'
+        if not self.scalar:
+            source += MANY.format(
+                name=self.name,
+                declared=joined,
+                passed=passed,
+                comma=comma,
+                prefix=RESERVED,
             )
 
-        if isinstance(node, ast.Call):
-            self.fail(node, 'calling a function cannot be compiled')
+        return source
 
-        self.fail(node, f'{type(node).__name__} cannot be compiled')
 
-    def unary(self, node):
-        """Translate a unary expression, including a draw.
+MODULE = '''# Generated by ranvar.compiler. Edits here are overwritten.
+# Model: {name}
+
+import cython
+from cython.cimports.ranvar.ranvar import RanVar
+
+{declarations}
+
+@cython.ccall
+{model}
+
+
+def {prefix}run({prefix}out: RanVar, {prefix}samples: cython.int{comma}{declared}):
+    {prefix}i: cython.int
+
+    for {prefix}i in range({prefix}samples):
+        {prefix}out._add({name}({passed}), 1.0)
+
+
+'''
+
+
+MANY = '''
+
+def {prefix}runMany({prefix}outs: list, {prefix}samples: cython.int{comma}{declared}):
+    {prefix}i: cython.int
+    {prefix}k: cython.int
+    {prefix}width: cython.int = len({prefix}outs)
+    {prefix}digest: RanVar
+
+    for {prefix}i in range({prefix}samples):
+        {prefix}values = {name}({passed})
+
+        for {prefix}k in range({prefix}width):
+            {prefix}digest = {prefix}outs[{prefix}k]
+            {prefix}digest._add({prefix}values[{prefix}k], 1.0)
+'''
+
+
+class Draws(ast.NodeTransformer):
+    """Rewrites a draw from a digest parameter into a call to sample().
+
+    ~a and a.sample() mean the same thing, but the invert slot has to return a
+    Python object, so only the second compiles to a C call. Only parameters
+    annotated as RanVars are rewritten, which leaves ~ on an integer meaning
+    what it always meant.
+    """
+
+    def __init__(self, digests):
+        """Prepare to rewrite draws.
+
+        Args:
+            digests (list): Names of the parameters annotated as RanVars.
+        """
+        self.digests = set(digests)
+
+    def visit_UnaryOp(self, node):
+        """Rewrite ~digest into digest.sample().
 
         Args:
             node (ast.UnaryOp): The expression node.
 
         Returns:
-            str: The equivalent Cython expression.
-
-        Raises:
-            RanVarCompileError: If the operand of ~ is not a RanVar.
+            ast.AST: The rewritten node, or the original.
         """
-        if isinstance(node.op, ast.USub):
-            return f'(-{self.expr(node.operand)})'
+        self.generic_visit(node)
 
-        if isinstance(node.op, ast.UAdd):
-            return f'(+{self.expr(node.operand)})'
+        if not isinstance(node.op, ast.Invert):
+            return node
 
-        if isinstance(node.op, ast.Not):
-            return f'(not {self.expr(node.operand)})'
+        if not isinstance(node.operand, ast.Name) or node.operand.id not in self.digests:
+            return node
 
-        if isinstance(node.op, ast.Invert):
-            operand = node.operand
+        return ast.Call(
+            func=ast.Attribute(value=node.operand, attr='sample', ctx=ast.Load()),
+            args=[],
+            keywords=[],
+        )
 
-            if not isinstance(operand, ast.Name) or operand.id not in self.draws:
-                self.fail(node, '~ can only be applied to a RanVar from the surrounding scope')
 
-            return f'{RESERVED}draw({operand.id})'
-
-        self.fail(node, f'the {type(node.op).__name__} operator cannot be compiled')
-
-    # Statements. --------------------------------------------------------------
-
-    def block(self, body, level):
-        """Translate a list of statements.
-
-        Args:
-            body (list): The statements.
-            level (int): Indentation depth inside the generated function.
-
-        Returns:
-            list: The generated lines.
-        """
-        out = []
-
-        for statement in body:
-            out.extend(self.stmt(statement, level))
-
-        if not out:
-            out.append('    '*level + 'pass')
-
-        return out
-
-    def stmt(self, node, level):
-        """Translate one statement.
-
-        Args:
-            node (ast.AST): The statement node.
-            level (int): Indentation depth inside the generated function.
-
-        Returns:
-            list: The generated lines.
-
-        Raises:
-            RanVarCompileError: If the statement is outside the subset.
-        """
-        pad = '    '*level
-
-        if isinstance(node, ast.Expr):
-            # A docstring is the one expression statement worth keeping around,
-            # and it has no effect to translate.
-            if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
-                return []
-
-            self.fail(node, 'an expression on its own has no effect and cannot be compiled')
-
-        if isinstance(node, ast.Pass):
-            return [pad + 'pass']
-
-        if isinstance(node, ast.Assign):
-            if len(node.targets) != 1 or not isinstance(node.targets[0], ast.Name):
-                self.fail(node, 'only assignment to a single name can be compiled')
-
-            return [f'{pad}{node.targets[0].id} = {self.expr(node.value)}']
-
-        if isinstance(node, ast.AugAssign):
-            if not isinstance(node.target, ast.Name):
-                self.fail(node, 'only assignment to a single name can be compiled')
-
-            op = BINOPS.get(type(node.op))
-
-            if op is None:
-                self.fail(node, f'the {type(node.op).__name__} operator cannot be compiled')
-
-            return [f'{pad}{node.target.id} {op}= {self.expr(node.value)}']
-
-        if isinstance(node, ast.If):
-            lines = [f'{pad}if {self.expr(node.test)}:']
-            lines.extend(self.block(node.body, level + 1))
-
-            if node.orelse:
-                lines.append(f'{pad}else:')
-                lines.extend(self.block(node.orelse, level + 1))
-
-            return lines
-
-        if isinstance(node, ast.For):
-            bound = ', '.join(self.intExpr(arg) for arg in node.iter.args)
-
-            lines = [f'{pad}for {node.target.id} in range({bound}):']
-            lines.extend(self.block(node.body, level + 1))
-
-            return lines
-
-        if isinstance(node, ast.While):
-            return self.loop(node, level, pad)
-
-        if isinstance(node, ast.Break):
-            return [pad + 'break']
-
-        if isinstance(node, ast.Continue):
-            return [pad + 'continue']
-
-        if isinstance(node, ast.Return):
-            return self.returns(node, pad)
-
-        self.fail(node, f'{type(node).__name__} cannot be compiled')
-
-    def loop(self, node, level, pad):
-        """Translate a while loop.
-
-        A compiled loop holds the GIL and never returns to the interpreter, so a
-        condition that never goes false would hang the process with no way to
-        interrupt it. The generated loop therefore checks for pending signals
-        every so often, which is what lets Ctrl-C break out of one.
-
-        Args:
-            node (ast.While): The statement node.
-            level (int): Indentation depth inside the generated function.
-            pad (str): Leading indentation.
-
-        Returns:
-            list: The generated lines.
-        """
-        guard = f'{RESERVED}guard{self.guards}'
-        self.guards += 1
-
-        inner = '    '*(level + 1)
-
-        lines = [
-            f'{pad}{guard} = 0',
-            f'{pad}while {self.expr(node.test)}:',
-            f'{inner}{guard} = {guard} + 1',
-            '',
-            f'{inner}if {guard} >= {SIGNAL_EVERY}:',
-            f'{inner}    {guard} = 0',
-            f'{inner}    PyErr_CheckSignals()',
-            '',
-        ]
-        lines.extend(self.block(node.body, level + 1))
-
-        return lines
-
-    def intExpr(self, node):
-        """Translate an expression that has to be a whole number.
-
-        Everything else in a compiled model is a double, but a range bound is a
-        count, so a literal is emitted as an integer and anything else is
-        converted to one.
-
-        Args:
-            node (ast.AST): The expression node.
-
-        Returns:
-            str: The equivalent Cython expression, typed as an integer.
-        """
-        if isinstance(node, ast.Constant) and isinstance(node.value, int) \
-                and not isinstance(node.value, bool):
-            return repr(node.value)
-
-        return f'<long>({self.expr(node)})'
-
-    def returns(self, node, pad):
-        """Translate a return statement.
-
-        The first return decides how many values the model produces; the rest
-        have to agree, since each value is collected into its own digest.
-
-        Args:
-            node (ast.Return): The statement node.
-            pad (str): Leading indentation.
-
-        Returns:
-            list: The generated lines.
-
-        Raises:
-            RanVarCompileError: If the model returns nothing, or a different
-                              number of values in different places.
-        """
-        if node.value is None:
-            self.fail(node, 'a compiled model has to return a value')
-
-        if isinstance(node.value, ast.Tuple):
-            width = len(node.value.elts)
-
-            if width == 0:
-                self.fail(node, 'a compiled model has to return a value')
-        else:
-            width = 0
-
-        if self.width is None:
-            self.width = width
-        elif self.width != width:
-            self.fail(
-                node,
-                f'this returns {width or 1} value(s) where an earlier return '
-                f'gives {self.width or 1}; they have to agree'
-            )
-
-        if width == 0:
-            return [f'{pad}return {self.expr(node.value)}']
-
-        lines = [
-            f'{pad}{RESERVED}res[{i}] = {self.expr(element)}'
-            for i, element in enumerate(node.value.elts)
-        ]
-        lines.append(f'{pad}return')
-
-        return lines
-
-    # Code generation. ---------------------------------------------------------
-
-    def signature(self):
-        """Build the C parameter list the model body takes.
-
-        Returns:
-            list: One 'type name' string per argument.
-        """
-        parts = [f'double {name}' for name in self.params]
-
-        for name in self.free:
-            kind = 'RanVar' if name in self.draws else 'double'
-            parts.append(f'{kind} {name}')
-
-        return parts
-
-    def arguments(self):
-        """Name the model body's arguments, in the order signature() gives them.
-
-        Returns:
-            list: The argument names.
-        """
-        return self.params + self.free
-
-    def generate(self):
-        """Translate the model into the source of a Cython module.
-
-        Returns:
-            str: The module source.
-
-        Raises:
-            RanVarCompileError: If the model is outside the compilable subset.
-        """
-        node = self.tree()
-
-        self.structure(node)
-        self.collect(node)
-        self.classify()
-
-        body = self.block(node.body, 1)
-
-        if self.width is None:
-            self.fail(node, 'a compiled model has to return a value')
-
-        if not alwaysReturns(node.body):
-            self.fail(node, 'every path through a compiled model has to return a value')
-
-        signature = self.signature()
-        arguments = self.arguments()
-
-        lines = [
-            '# Generated by ranvar.compiler. Edits here are overwritten.',
-            f'# Model: {self.name}',
-            '',
-            'from cpython.exc cimport PyErr_CheckSignals',
-            'from ranvar.ranvar cimport RanVar',
-            '',
-            '',
-            f'cdef inline double {RESERVED}draw(RanVar v):',
-            '    return v.sample()',
-            '',
-            '',
-        ]
-
-        if self.width == 0:
-            lines.append(f'cdef double {RESERVED}body({", ".join(signature)}):')
-        else:
-            declared = signature + [f'double* {RESERVED}res']
-            lines.append(f'cdef void {RESERVED}body({", ".join(declared)}):')
-
-        for name in self.locals:
-            lines.append(f'    cdef double {name}')
-
-        for name in self.counters:
-            lines.append(f'    cdef long {name}')
-
-        for index in range(self.guards):
-            lines.append(f'    cdef long {RESERVED}guard{index}')
-
-        lines.extend(body)
-        lines.extend(['', ''])
-        lines.extend(self.driver(signature, arguments))
-
-        return '\n'.join(lines) + '\n'
-
-    def driver(self, signature, arguments):
-        """Build the loop that runs the model and collects what it returns.
-
-        This is the part that has to stay in C: it calls the body and feeds the
-        digests directly, so a whole simulation crosses into the interpreter
-        once rather than once per sample.
-
-        Args:
-            signature (list): The model body's C parameter list.
-            arguments (list): The model body's argument names.
-
-        Returns:
-            list: The generated lines.
-        """
-        passed = ', '.join(arguments)
-        comma  = ', ' if arguments else ''
-
-        if self.width == 0:
-            return [
-                f'def run(RanVar {RESERVED}out, int {RESERVED}samples'
-                f'{comma}{", ".join(signature)}):',
-                f'    cdef int {RESERVED}i',
-                '',
-                f'    for {RESERVED}i in range({RESERVED}samples):',
-                f'        {RESERVED}out._add({RESERVED}body({passed}), 1.0)',
-            ]
-
-        lines = [
-            f'def run(list {RESERVED}outs, int {RESERVED}samples'
-            f'{comma}{", ".join(signature)}):',
-            f'    cdef int {RESERVED}i',
-            f'    cdef double {RESERVED}res[{self.width}]',
-        ]
-
-        for i in range(self.width):
-            lines.append(f'    cdef RanVar {RESERVED}o{i} = {RESERVED}outs[{i}]')
-
-        lines.extend([
-            '',
-            f'    for {RESERVED}i in range({RESERVED}samples):',
-            f'        {RESERVED}body({passed}{comma}{RESERVED}res)',
-        ])
-
-        for i in range(self.width):
-            lines.append(f'        {RESERVED}o{i}._add({RESERVED}res[{i}], 1.0)')
-
-        return lines
-
-
-def alwaysReturns(body):
-    """Report whether a block of statements returns on every path.
-
-    The generated body is a C function, so a path that falls off the end would
-    hand back whatever happened to be in the return register.
+def isRanVar(annotation):
+    """Report whether an annotation names the RanVar type.
 
     Args:
-        body (list): The statements to check.
+        annotation (ast.AST): The annotation node, or None.
 
     Returns:
-        bool: True if every path returns.
+        bool: True if the annotation is RanVar or something.RanVar.
     """
-    if not body:
-        return False
+    if isinstance(annotation, ast.Name):
+        return annotation.id == 'RanVar'
 
-    last = body[-1]
-
-    if isinstance(last, ast.Return):
-        return True
-
-    if isinstance(last, ast.If):
-        return (
-            bool(last.orelse)
-            and alwaysReturns(last.body)
-            and alwaysReturns(last.orelse)
-        )
+    if isinstance(annotation, ast.Attribute):
+        return annotation.attr == 'RanVar'
 
     return False
 
@@ -836,7 +478,7 @@ def includeDir():
     """Locate the directory that has to be on Cython's include path.
 
     The generated module cimports ranvar.ranvar, so Cython needs the directory
-    holding the ranvar package, not the package itself.
+    holding the ranvar package rather than the package itself.
 
     Returns:
         str: Path to put on the include path.
@@ -850,8 +492,8 @@ def cacheKey(source):
     """Build the name a generated module is cached under.
 
     Keyed on the generated source, the interpreter and the compiled RanVar the
-    module will link against, so that rebuilding ranvar or changing Python does
-    not leave a stale module behind that was built for a different layout.
+    module links against, so rebuilding ranvar does not leave a stale module
+    behind that was built against a different layout.
 
     Args:
         source (str): The generated module source.
@@ -877,21 +519,18 @@ def build(source, key):
 
     The module is built in a private directory and moved into place in one step,
     so a half built module is never importable and two processes compiling the
-    same model at once cannot see each other's work in progress.
+    same model cannot see each other's work in progress.
 
     Args:
         source (str): The generated module source.
         key (str): The cache key from cacheKey().
 
     Returns:
-        module: The imported module, exposing run().
+        module: The imported module, exposing the run functions.
 
     Raises:
         RanVarCompileError: If the build fails.
     """
-    import shutil
-    import tempfile
-
     directory = cacheDir()
     os.makedirs(directory, exist_ok=True)
 
@@ -903,13 +542,15 @@ def build(source, key):
         work = tempfile.mkdtemp(prefix=f'{name}.', dir=directory)
 
         try:
-            pyx = os.path.join(work, name + '.pyx')
+            # A .py rather than a .pyx: pure Python mode is what lets the
+            # model's own annotations carry its types.
+            module = os.path.join(work, name + '.py')
 
-            with open(pyx, 'w') as handle:
+            with open(module, 'w') as handle:
                 handle.write(source)
 
             result = subprocess.run(
-                [sys.executable, '-c', BUILD, name, pyx, work, includeDir()],
+                [sys.executable, '-c', BUILD, name, module, work, includeDir()],
                 capture_output=True,
                 text=True,
                 cwd=work,
@@ -922,37 +563,34 @@ def build(source, key):
                 )
 
             # Kept beside the module so a compiled model can be read back.
-            shutil.copyfile(pyx, os.path.join(directory, name + '.pyx'))
+            shutil.copyfile(module, os.path.join(directory, name + '.py'))
             os.replace(os.path.join(work, name + suffix), target)
         finally:
             shutil.rmtree(work, ignore_errors=True)
 
-    spec   = importlib.util.spec_from_file_location(name, target)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    spec     = importlib.util.spec_from_file_location(name, target)
+    imported = importlib.util.module_from_spec(spec)
 
-    return module
+    spec.loader.exec_module(imported)
+
+    return imported
 
 
 # The decorator. ---------------------------------------------------------------
 
 class CompiledMonteCarlo():
-    """A function compiled into a monte carlo simulation that runs in C.
+    """A model compiled into a monte carlo simulation that runs in C.
 
     Like MonteCarlo, calling the wrapper runs the model repeatedly and collects
-    the results into a RanVar. Unlike it, the model is translated into Cython
-    and the loop around it is compiled, so a call crosses into the interpreter
-    once rather than once per sample.
+    the results into a RanVar. Unlike it, the model's own source is compiled by
+    Cython and the loop around it with it, so a call crosses into the
+    interpreter once rather than once per sample.
 
-    The translation covers arithmetic over numbers, draws from RanVars,
-    assignment, if and else, for loops over range, while loops, break and
-    continue. Anything else is refused when the model is compiled rather than
-    run through the interpreter, so a model either gets the speed the decorator
-    is for or says why it cannot.
-
-    A compiled while loop checks for pending signals as it runs, so one whose
-    condition never goes false can still be interrupted rather than hanging the
-    process.
+    The model is compiled in Cython's pure Python mode, which takes its types
+    from ordinary annotations. Any Python compiles; how much of it becomes C
+    depends on how much is annotated. Digests have to arrive as parameters
+    annotated RanVar, since a module level name is a Python object to Cython
+    whatever it holds and drawing from one would quietly be slow.
 
     Compiling takes several seconds, so it happens on the first call rather than
     at decoration, and the result is cached on disk and reused by later runs and
@@ -961,6 +599,12 @@ class CompiledMonteCarlo():
     Attributes:
         samples (int): Number of runs a plain call performs.
         maxBins (int): Number of centroids each returned RanVar maintains.
+
+    Example:
+        >>> @cfunc
+        ... def profit(revenue: RanVar, cost: RanVar) -> cython.double:
+        ...     return ~revenue - ~cost
+        >>> profit(revenueDigest, costDigest)
     """
 
     def __init__(self, fn, samples=DEFAULT_SAMPLES, maxBins=DEFAULT_MAXBINS):
@@ -986,8 +630,9 @@ class CompiledMonteCarlo():
         self.samples = _checkSamples(samples)
         self.maxBins = maxBins
 
-        self.module     = None
-        self.translator = None
+        self.module = None
+        self.model  = None
+        self.width  = None
 
     def compile(self):
         """Compile the model now instead of on the first call.
@@ -1001,11 +646,11 @@ class CompiledMonteCarlo():
         if self.module is not None:
             return self
 
-        translator = Translator(self.__wrapped__)
-        source     = translator.generate()
+        model  = Model(self.__wrapped__)
+        source = model.generate()
 
-        self.module     = build(source, cacheKey(source))
-        self.translator = translator
+        self.module = build(source, cacheKey(source))
+        self.model  = model
 
         return self
 
@@ -1013,8 +658,8 @@ class CompiledMonteCarlo():
         """Run the compiled simulation with the default sample count.
 
         Args:
-            *args: Numeric arguments for the model.
-            **kwargs: Numeric arguments for the model.
+            *args: Arguments for the model, digests included.
+            **kwargs: Arguments for the model, digests included.
 
         Returns:
             RanVar: The distribution of the results, or a tuple of them for a
@@ -1038,51 +683,61 @@ class CompiledMonteCarlo():
             self.__wrapped__, samples=samples, maxBins=self.maxBins
         )
 
-        other.module     = self.module
-        other.translator = self.translator
+        other.module = self.module
+        other.model  = self.model
+        other.width  = self.width
 
         return other
 
-    def _bind(self, args, kwargs):
-        """Work out the arguments the compiled loop takes for this call.
-
-        The model's own parameters come from the call, and the names it reads
-        from the surrounding scope are looked up again now rather than being
-        fixed when it was compiled, so rebinding one between calls is seen.
+    def _prepare(self, args, kwargs):
+        """Get the model's arguments in order, and refresh what it reads.
 
         Args:
             args (tuple): Positional arguments for the model.
             kwargs (dict): Keyword arguments for the model.
 
         Returns:
-            list: The arguments to hand to the compiled loop.
-
-        Raises:
-            TypeError: If a name has changed into something the compiled module
-                     cannot take.
+            list: The arguments to hand to the compiled driver.
         """
-        translator = self.translator
-        bound      = inspect.signature(self.__wrapped__).bind(*args, **kwargs)
+        bound = inspect.signature(self.__wrapped__).bind(*args, **kwargs)
 
         bound.apply_defaults()
 
-        values = [float(bound.arguments[name]) for name in translator.params]
+        # The generated module has a namespace of its own, so whatever the model
+        # reads from the module it was written in is copied across before it
+        # runs, and copied again each call in case any of it has been rebound.
+        for name, value in self.model.bindings().items():
+            setattr(self.module, name, value)
 
-        for name in translator.free:
-            value = translator.resolve(name)
+        return [bound.arguments[name] for name in self.model.params]
 
-            if name in translator.draws:
-                if not isinstance(value, RanVar):
-                    raise TypeError(
-                        f'{self.__name__}(): {name!r} was a RanVar when the model '
-                        f'was compiled and is now a {type(value).__name__!r}'
-                    )
+    def _shape(self, values):
+        """Work out how many values the model returns, by running it once.
 
-                values.append(value)
-            else:
-                values.append(float(value))
+        A model annotated as returning a C number is settled by the annotation
+        alone. Otherwise it is compiled with @cython.ccall, so it stays callable
+        from Python and can be asked directly rather than guessed at, at the
+        cost of one extra evaluation the first time.
 
-        return values
+        Args:
+            values (list): The model's arguments.
+
+        Returns:
+            int: The number of values returned, 0 for a single one.
+        """
+        if self.width is not None:
+            return self.width
+
+        if self.model.scalar:
+            self.width = 0
+
+            return self.width
+
+        probe = getattr(self.module, self.model.name)(*values)
+
+        self.width = len(probe) if isinstance(probe, tuple) else 0
+
+        return self.width
 
     def _run(self, samples, args, kwargs):
         """Compile if needed, then run the simulation.
@@ -1098,16 +753,17 @@ class CompiledMonteCarlo():
         """
         self.compile()
 
-        values = self._bind(args, kwargs)
+        values = self._prepare(args, kwargs)
+        width  = self._shape(values)
 
-        if self.translator.width == 0:
+        if width == 0:
             out = RanVar(maxBins=self.maxBins)
-            self.module.run(out, samples, *values)
+            getattr(self.module, f'{RESERVED}run')(out, samples, *values)
 
             return out
 
-        outs = [RanVar(maxBins=self.maxBins) for _ in range(self.translator.width)]
-        self.module.run(outs, samples, *values)
+        outs = [RanVar(maxBins=self.maxBins) for _ in range(width)]
+        getattr(self.module, f'{RESERVED}runMany')(outs, samples, *values)
 
         return tuple(outs)
 
@@ -1121,18 +777,26 @@ class CompiledMonteCarlo():
 
 
 def cfunc(fn=None, *, samples=DEFAULT_SAMPLES, maxBins=DEFAULT_MAXBINS):
-    """Compile a function into a monte carlo simulation that runs in C.
+    """Compile a model into a monte carlo simulation that runs in C.
 
-    The same idea as func, but the model is translated into Cython and the loop
-    around it compiled, so the whole simulation runs without returning to the
-    interpreter. In exchange the model has to stay within what can be turned
-    into C: arithmetic over numbers, draws from RanVars with ~, assignments,
-    if and else, for loops over range, while loops, break and continue, and a
-    return of one value or a tuple of them.
+    The same idea as func, but the model's own source is compiled by Cython in
+    pure Python mode and the loop around it compiled with it, so the simulation
+    runs without returning to the interpreter.
+
+    The model stays ordinary Python. Its types come from ordinary annotations,
+    and how much of it becomes C rather than object code depends on how much of
+    it is annotated. Digests have to arrive as parameters annotated RanVar: a
+    module level name is a Python object to Cython whatever it holds, so a model
+    drawing from one would compile but not go fast, and that is refused rather
+    than allowed to look like a win.
+
+    ~ is the one thing not carried across verbatim. The invert slot has to
+    return a Python object, so a draw from a digest parameter is rewritten to
+    sample(), which is the same thing and does compile to a direct call.
 
     Compiling takes several seconds and happens on the first call, not at
-    decoration. The result is cached on disk under ~/.cache/ranvar and reused
-    by later calls and later processes.
+    decoration. The result is cached under ~/.cache/ranvar and reused by later
+    calls and later processes.
 
     Args:
         fn (callable, optional): The model to compile, supplied when the
@@ -1149,10 +813,15 @@ def cfunc(fn=None, *, samples=DEFAULT_SAMPLES, maxBins=DEFAULT_MAXBINS):
         RanVarCompileError: On the first call, if the model cannot be compiled.
 
     Example:
+        >>> import cython
+        >>> from ranvar import RanVar, cfunc
+
         >>> @cfunc
-        ... def profit():
-        ...     return ~revenue - ~cost
-        >>> profit()
+        ... def profit(revenue: RanVar, cost: RanVar) -> cython.double:
+        ...     margin: cython.double = ~revenue - ~cost
+        ...     return margin
+
+        >>> profit(revenueDigest, costDigest)
     """
     _checkSamples(samples)
 
