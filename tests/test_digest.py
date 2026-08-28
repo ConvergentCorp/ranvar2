@@ -273,3 +273,77 @@ def test_quantile_two_centroids():
 
     assert x.quantile(0.5) > x.lower()
     assert x.quantile(0.99) < x.upper()
+
+
+def test_sample_is_not_quantised():
+    """Tests that sample() draws continuous values rather than rounded integers."""
+    std = 100
+    mu  = 100
+    np.random.seed(31337)
+    data = np.random.randn(10_000)*std + mu
+    x = mc.Digest(maxBins=64)
+    for d in data:
+        x.add(d)
+
+    mc.seed(1234)
+    draws = [x.sample() for _ in range(200)]
+
+    assert any(not float(v).is_integer() for v in draws), \
+        'every draw landed on an integer, sample() is still rounding'
+
+    for v in draws:
+        assert x.lower() <= v <= x.upper(), f'draw {v} outside the support'
+
+
+def test_seed_is_reproducible():
+    """Tests that seed() pins the sequence of draws sample() produces."""
+    std = 100
+    mu  = 100
+    np.random.seed(31337)
+    data = np.random.randn(10_000)*std + mu
+    x = mc.Digest(maxBins=64)
+    for d in data:
+        x.add(d)
+
+    mc.seed(42)
+    first = [x.sample() for _ in range(20)]
+
+    mc.seed(42)
+    again = [x.sample() for _ in range(20)]
+
+    mc.seed(43)
+    other = [x.sample() for _ in range(20)]
+
+    assert first == again, 'the same seed produced a different sequence'
+    assert first != other, 'a different seed produced the same sequence'
+
+
+def test_mean():
+    """Tests that mean() is the exact mean of the data added to the digest.
+
+    Merging replaces two centroids with their weighted average, which leaves the
+    total weighted sum untouched, so no accuracy is lost no matter how much the
+    digest compresses.
+    """
+    std = 100
+    mu  = 100
+    np.random.seed(31337)
+    data = np.random.randn(10_000)*std + mu
+    x = mc.Digest(maxBins=32)
+    for d in data:
+        x.add(d)
+
+    assert x.getActiveBinCount() == 32, 'expected the digest to have compressed'
+    np.testing.assert_allclose(x.mean(), data.mean(), rtol=1e-12)
+
+
+def test_mean_empty_digest():
+    """Tests that mean() rejects an empty digest rather than dividing by zero."""
+    x = mc.Digest(maxBins=32)
+
+    try:
+        x.mean()
+    except ValueError:
+        pass
+    else:
+        assert False, 'mean() on an empty digest should raise ValueError'

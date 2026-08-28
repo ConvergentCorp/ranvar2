@@ -6,7 +6,20 @@ from cython import int as cint
 from cython import void as cvoid
 
 from cython.cimports.libc.stdlib import rand as crand
+from cython.cimports.libc.stdlib import srand as csrand
 from cython.cimports.libc.stdlib import RAND_MAX as C_RAND_MAX
+
+
+def seed(value):
+    """Seed the random number generator that sample() draws from.
+
+    Sampling uses the C library generator, which is global to the process, so
+    this seeds every digest at once rather than any single instance.
+
+    Args:
+        value (int): Seed for the generator.
+    """
+    csrand(value)
 
 
 @cclass
@@ -492,27 +505,41 @@ class RanVar():
     def sample(self):
         """Sample a single value from the distribution represented by the digest.
 
-        Generates a random quantile and returns the corresponding value,
-        rounded to the nearest integer.
-
-        Args:
-            size (int, optional): Currently unused, always returns a single sample.
-                                Defaults to 1.
+        Draws a uniform probability and returns the quantile at that
+        probability, so the draw follows the distribution the digest models.
+        Use seed() to make a sequence of draws reproducible.
 
         Returns:
-            int: A sampled integer value from the distribution.
-
-        Note:
-            Despite the size parameter, this method currently only returns
-            a single sample.
+            float: A value drawn from the distribution.
         """
 
         p: cdouble = cast(cdouble, crand()) / cast(cdouble, C_RAND_MAX)
-        return int(round(self.quantile(p)))
+        return self.quantile(p)
 
 
     def mean(self):
-        pass
+        """Compute the mean of the distribution.
+
+        Merging two centroids replaces them with their weighted average, which
+        leaves the total weighted sum untouched, so this is the exact mean of
+        the data added to the digest rather than an approximation of it.
+
+        Returns:
+            float: The weighted mean of the centroids.
+
+        Raises:
+            ValueError: If the digest is empty.
+        """
+        som: cdouble = 0
+        i: cint
+
+        if self.nActive == 0:
+            raise ValueError('mean() is undefined for an empty digest')
+
+        for i in range(self.nActive):
+            som = som + self._bins[i]*self._cnts[i]
+
+        return som / self._sumWeights()
 
     def fit(self, x):
         """Fit the digest to a collection of data points.
