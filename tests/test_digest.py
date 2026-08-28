@@ -337,31 +337,40 @@ def test_mean():
     np.testing.assert_allclose(x.mean(), data.mean(), rtol=1e-12)
 
 
-def test_mean_empty_digest():
-    """Tests that mean() rejects an empty digest rather than dividing by zero."""
-    x = mc.Digest(maxBins=32)
+def test_empty_digest_raises():
+    """Tests that querying an empty digest raises rather than reading out of bounds.
 
-    try:
-        x.mean()
-    except ValueError:
-        pass
-    else:
-        assert False, 'mean() on an empty digest should raise ValueError'
-
-
-def test_quantile_empty_digest():
-    """Tests that quantile() rejects an empty digest.
-
-    quantile() reads the centroid arrays without bounds checking, and _upper()
-    indexes nActive-1, so an empty digest would otherwise read off the front of
-    the buffer rather than fail.
+    The centroid arrays are indexed with bounds checking off, and upper() reads
+    nActive-1, which is -1 before anything has been added. Every accessor that
+    reaches one of those reads has to refuse the empty digest instead of
+    returning whatever happens to sit in front of the buffer.
     """
     x = mc.Digest(maxBins=32)
 
-    for p in [0.0, 0.5, 1.0]:
+    accessors = [
+        ('lower()',        lambda: x.lower()),
+        ('upper()',        lambda: x.upper()),
+        ('mean()',         lambda: x.mean()),
+        ('cdf()',          lambda: x.cdf(5.0)),
+        ('ccdf()',         lambda: x.ccdf(5.0)),
+        ('dcdf()',         lambda: x.dcdf(5.0)),
+        ('dccdf()',        lambda: x.dccdf(5.0)),
+        ('quantile(0.0)',  lambda: x.quantile(0.0)),
+        ('quantile(0.5)',  lambda: x.quantile(0.5)),
+        ('quantile(1.0)',  lambda: x.quantile(1.0)),
+        ('sample()',       lambda: x.sample()),
+    ]
+
+    for name, call in accessors:
         try:
-            x.quantile(p)
+            call()
         except ValueError:
             pass
         else:
-            assert False, f'quantile({p}) on an empty digest should raise ValueError'
+            assert False, f'{name} on an empty digest should raise ValueError'
+
+    # And the guards must not fire once there is something to report on.
+    x.fit([1.0, 2.0, 3.0, 4.0, 5.0])
+
+    for name, call in accessors:
+        call()

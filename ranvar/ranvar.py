@@ -226,7 +226,13 @@ class RanVar():
 
         Returns:
             float: The smallest centroid value.
+
+        Raises:
+            ValueError: If the digest is empty.
         """
+        if self.nActive == 0:
+            raise ValueError('cannot take the lower bound of an empty digest')
+
         return self._bins[0]
 
     @ccall
@@ -239,7 +245,15 @@ class RanVar():
 
         Returns:
             float: The largest centroid value.
+
+        Raises:
+            ValueError: If the digest is empty. The index below is nActive-1,
+                      which reads off the front of the buffer when nothing has
+                      been added, and bounds checking is off.
         """
+        if self.nActive == 0:
+            raise ValueError('cannot take the upper bound of an empty digest')
+
         return self._bins[self.nActive - 1]
 
     @cfunc
@@ -343,6 +357,9 @@ class RanVar():
 
         Returns:
             float: The smallest centroid value.
+
+        Raises:
+            ValueError: If the digest is empty.
         """
         return self._lower()
 
@@ -351,6 +368,9 @@ class RanVar():
 
         Returns:
             float: The largest centroid value.
+
+        Raises:
+            ValueError: If the digest is empty.
         """
         return self._upper()
 
@@ -476,11 +496,6 @@ class RanVar():
 
         c: cdouble[:] = self._bins
         m: cdouble[:] = self._cnts
-
-        # The bounds below are read without checking, and _upper() indexes
-        # nActive-1, so an empty digest would read off the front of the buffer.
-        if self.nActive == 0:
-            raise ValueError('quantile() is undefined for an empty digest')
 
         if p <= 0:
             return self._lower()
