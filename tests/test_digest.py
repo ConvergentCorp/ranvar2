@@ -374,3 +374,89 @@ def test_empty_digest_raises():
 
     for name, call in accessors:
         call()
+
+
+def test_quantile_matches_a_linear_search():
+    """Tests the binary search against a naive scan of the same ladder.
+
+    Boundaries are where a binary search goes wrong, so this checks a dense
+    sweep of probabilities against an independent, obviously correct walk of the
+    weight ladder rather than against the digest's own arithmetic.
+    """
+    np.random.seed(31337)
+    x = mc.Digest(maxBins=64)
+    for d in np.random.randn(10_000)*100 + 100:
+        x.add(d)
+
+    m = x.getWeights()
+    c = x.getBins()
+    n = len(m)
+    W = m.sum()
+
+    def naive(p):
+        wi = 0.0
+        w_ = p*W
+
+        for i in range(n-1):
+            gap = (m[i] if i == 0 else m[i]/2) + (m[i+1] if i == n-2 else m[i+1]/2)
+
+            if wi <= w_ < wi + gap:
+                return (w_ - wi)/gap * (c[i+1] - c[i]) + c[i]
+
+            wi = wi + gap
+
+        return x.upper()
+
+    for p in np.linspace(1e-9, 1 - 1e-9, 3000):
+        got = x.quantile(p)
+        want = naive(p)
+        assert abs(got - want) <= 1e-9 * max(1.0, abs(want)), \
+            f'p={p}: binary search gave {got}, linear walk gave {want}'
+
+
+def test_quantile_reflects_points_added_after_a_query():
+    """Tests that the cached weight ladder is rebuilt once more points arrive.
+
+    quantile() caches the ladder and rebuilds it only when a point has been
+    added since, so a missed invalidation would answer as though the later
+    points had never been added.
+    """
+    np.random.seed(31337)
+    data = np.random.randn(400)*10 + 50
+
+    live = mc.Digest(maxBins=16)
+
+    for i, d in enumerate(data):
+        live.add(d)
+
+        if i % 37 != 0:
+            continue
+
+        # Querying here populates the cache, so the next add has to clear it.
+        live.quantile(0.5)
+
+        fresh = mc.Digest(maxBins=16)
+        for e in data[:i+1]:
+            fresh.add(e)
+
+        for p in [0.05, 0.25, 0.5, 0.75, 0.95]:
+            assert live.quantile(p) == fresh.quantile(p), \
+                f'stale ladder after {i+1} points, p={p}'
+
+
+def test_ladder_is_rebuilt_after_pickle_and_copy():
+    """Tests that a restored digest rebuilds the ladder it never received.
+
+    The cache is not serialised, so a copy that did not mark it stale would
+    search a ladder full of zeros.
+    """
+    np.random.seed(31337)
+    x = mc.Digest(maxBins=32)
+    for d in np.random.randn(2_000)*100 + 100:
+        x.add(d)
+
+    x.quantile(0.5)
+
+    for y in [pickle.loads(pickle.dumps(x)), copy.deepcopy(x)]:
+        for p in [0.01, 0.1, 0.5, 0.9, 0.99]:
+            assert y.quantile(p) == x.quantile(p), f'restored digest differs at p={p}'

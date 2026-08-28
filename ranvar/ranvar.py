@@ -35,9 +35,16 @@ class RanVar():
     When the number of centroids exceeds maxBins, nearby centroids are merged to maintain
     the memory bound while preserving accuracy.
 
+    quantile() walks a ladder of cumulative weights, one rung per pair of
+    adjacent centroids. That ladder only changes when a point is added, so it is
+    cached and searched rather than rebuilt on every call, which is what makes
+    repeated sampling from a fitted digest cheap.
+
     Attributes:
         bins (np.ndarray): Array storing centroid values (x-coordinates)
         cnts (np.ndarray): Array storing centroid weights (counts)
+        cumw (np.ndarray): Cached cumulative weight at the start of each segment
+        gaps (np.ndarray): Cached weight spanned by each segment
         maxBins (int): Maximum number of centroids to maintain
         nActive (int): Current number of active centroids
 
@@ -49,12 +56,21 @@ class RanVar():
     """    
     _bins: cdouble[:]
     _cnts: cdouble[:]
+    _cumw: cdouble[:]
+    _gaps: cdouble[:]
 
     bins: np.ndarray
     cnts: np.ndarray
+    cumw: np.ndarray
+    gaps: np.ndarray
 
     maxBins: cint
     nActive: cint
+
+    # Total weight as _sumWeights() would compute it, cached alongside the
+    # ladder, and a flag saying whether either still reflects the centroids.
+    _total: cdouble
+    _stale: cint
 
     def __init__(self, maxBins=32):
         """Initialize a new t-digest.
@@ -68,9 +84,16 @@ class RanVar():
 
         self.bins = np.zeros(self.maxBins + 1, dtype=np.float64)
         self.cnts = np.zeros(self.maxBins + 1, dtype=np.float64)
+        self.cumw = np.zeros(self.maxBins + 1, dtype=np.float64)
+        self.gaps = np.zeros(self.maxBins + 1, dtype=np.float64)
 
         self._bins = self.bins
         self._cnts = self.cnts
+        self._cumw = self.cumw
+        self._gaps = self.gaps
+
+        self._total = 0
+        self._stale = 1
 
     @ccall
     @boundscheck(False)
@@ -215,6 +238,8 @@ class RanVar():
 
             self._shiftLeftAndOverride(k+1)
 
+        self._stale = 1
+
 
     @ccall
     @boundscheck(False)
@@ -316,6 +341,58 @@ class RanVar():
             yi_n = yi
 
         return yi, yi_n
+
+    @cfunc
+    @boundscheck(False)
+    @wraparound(False)
+    @cdivision(True)
+    @initializedcheck(False)
+    def _rebuildLadder(self) -> cvoid:
+        """Recompute the cumulative weight ladder quantile() searches.
+
+        Rung i is the cumulative weight at centroid i, and gap i is the weight
+        the segment from centroid i to i+1 spans. The gaps sum to the total
+        weight, which is what lets a probability be located in the ladder.
+
+        The total is summed in the same order as _sumWeights() so the two agree
+        to the last bit.
+        """
+        i: cint
+        som: cdouble
+        wGap: cdouble
+
+        m = self._cnts
+
+        som = 0
+        for i in range(self.nActive):
+            som = som + m[i]
+
+        self._total = som
+
+        som = 0
+        self._cumw[0] = 0
+
+        for i in range(self.nActive - 1):
+            # An outer centroid contributes its full weight to its only segment,
+            # an interior one half to each side. The two ends are tested
+            # separately so the gaps still sum to the total when there are only
+            # two centroids and segment 0 is both the first and the last.
+            if i == 0:
+                wGap = m[i]
+            else:
+                wGap = m[i]/2
+
+            if i == self.nActive - 2:
+                wGap = wGap + m[i+1]
+            else:
+                wGap = wGap + m[i+1]/2
+
+            self._gaps[i] = wGap
+
+            som = som + wGap
+            self._cumw[i+1] = som
+
+        self._stale = 0
 
     # Public API. --------------------------------------------------------------
 
@@ -472,9 +549,11 @@ class RanVar():
     def quantile(self, p: cdouble) -> cdouble:
         """Compute the quantile for a given probability.
 
-        Uses linear interpolation between centroids to estimate the quantile.
-        The interpolation accounts for the different weighting schemes at
-        boundaries and interior points.
+        Locates the probability in the cumulative weight ladder by binary
+        search, then interpolates linearly between the two centroids of the
+        segment it lands in. The ladder is rebuilt only when a point has been
+        added since it was last built, so drawing repeatedly from a digest that
+        is no longer changing costs a search rather than a scan.
 
         Args:
             p (float): Probability value between 0 and 1. Values outside that
@@ -487,51 +566,49 @@ class RanVar():
             ValueError: If the digest is empty.
         """
         W: cdouble
-        wi: cdouble
         w_: cdouble
-        wGap: cdouble
-        wi_n: cdouble
         fraction: cdouble
-        i: cint
+        lo: cint
+        hi: cint
+        mid: cint
 
-        c: cdouble[:] = self._bins
-        m: cdouble[:] = self._cnts
+        c   = self._bins
+        cum = self._cumw
 
         if p <= 0:
             return self._lower()
         elif p >= 1:
             return self._upper()
-        else:
-            W  = self._sumWeights()
-            wi = 0
-            w_ = p*W
 
-            for i in range(self.nActive-1):
-                # Segment i spans centroids i and i+1, so the last segment is
-                # nActive-2, not nActive-1. An outer centroid contributes its
-                # full weight to its only segment, an interior one half to each
-                # side; that is what makes the gaps sum to W. The two ends are
-                # tested separately so this still holds when there are only two
-                # centroids and segment 0 is both the first and the last.
-                if i == 0:
-                    wGap = m[i]
-                else:
-                    wGap = m[i]/2
+        if self._stale:
+            self._rebuildLadder()
 
-                if i == self.nActive - 2:
-                    wGap = wGap + m[i+1]
-                else:
-                    wGap = wGap + m[i+1]/2
+        W  = self._total
+        w_ = p*W
 
-                wi_n = wi + wGap
+        # The rungs are non decreasing, so the segment holding w_ is the last
+        # one starting at or below it. Searching for the last rather than the
+        # first also steps over any segment of zero weight, which has no
+        # interior to interpolate across.
+        lo = 0
+        hi = self.nActive - 1
 
-                if wi <= w_ < wi_n:
-                    fraction = (w_ - wi) / wGap
-                    return fraction * (c[i+1] - c[i]) + c[i]
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
 
-                wi = wi_n
+            if cum[mid] <= w_:
+                lo = mid
+            else:
+                hi = mid - 1
 
+        # Past the last segment: one centroid only, or p*W rounded up to the
+        # total. Either way the answer is the top of the support.
+        if lo > self.nActive - 2:
             return self._upper()
+
+        fraction = (w_ - cum[lo]) / self._gaps[lo]
+
+        return fraction * (c[lo+1] - c[lo]) + c[lo]
 
 
     def sample(self):
@@ -615,4 +692,9 @@ class RanVar():
 
         self._bins = self.bins
         self._cnts = self.cnts
+
+        # __init__ has already marked it stale, since __reduce__ rebuilds through
+        # the constructor. Repeated here so the rule that any change to the
+        # centroids invalidates the ladder holds wherever they are assigned.
+        self._stale = 1
     
