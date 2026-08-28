@@ -347,3 +347,21 @@ def test_mean_empty_digest():
         pass
     else:
         assert False, 'mean() on an empty digest should raise ValueError'
+
+
+def test_quantile_empty_digest():
+    """Tests that quantile() rejects an empty digest.
+
+    quantile() reads the centroid arrays without bounds checking, and _upper()
+    indexes nActive-1, so an empty digest would otherwise read off the front of
+    the buffer rather than fail.
+    """
+    x = mc.Digest(maxBins=32)
+
+    for p in [0.0, 0.5, 1.0]:
+        try:
+            x.quantile(p)
+        except ValueError:
+            pass
+        else:
+            assert False, f'quantile({p}) on an empty digest should raise ValueError'

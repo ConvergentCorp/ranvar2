@@ -444,7 +444,12 @@ class RanVar():
         """
         return -self.dcdf(k)
 
-    def quantile(self, p):
+    @ccall
+    @boundscheck(False)
+    @wraparound(False)
+    @cdivision(True)
+    @initializedcheck(False)
+    def quantile(self, p: cdouble) -> cdouble:
         """Compute the quantile for a given probability.
 
         Uses linear interpolation between centroids to estimate the quantile.
@@ -452,22 +457,37 @@ class RanVar():
         boundaries and interior points.
 
         Args:
-            p (float): Probability value between 0 and 1.
+            p (float): Probability value between 0 and 1. Values outside that
+                     range clamp to the ends of the support.
 
         Returns:
             float: Estimated quantile value.
 
         Raises:
-            No explicit validation, but p should be in [0, 1] for meaningful results.
+            ValueError: If the digest is empty.
         """
+        W: cdouble
+        wi: cdouble
+        w_: cdouble
+        wGap: cdouble
+        wi_n: cdouble
+        fraction: cdouble
+        i: cint
+
+        c: cdouble[:] = self._bins
+        m: cdouble[:] = self._cnts
+
+        # The bounds below are read without checking, and _upper() indexes
+        # nActive-1, so an empty digest would read off the front of the buffer.
+        if self.nActive == 0:
+            raise ValueError('quantile() is undefined for an empty digest')
+
         if p <= 0:
             return self._lower()
         elif p >= 1:
             return self._upper()
         else:
             W  = self._sumWeights()
-            m = self.cnts
-            c = self.bins
             wi = 0
             w_ = p*W
 
@@ -492,14 +512,11 @@ class RanVar():
 
                 if wi <= w_ < wi_n:
                     fraction = (w_ - wi) / wGap
-                    c_ = fraction * (c[i+1] - c[i]) + c[i]
-                    return c_
+                    return fraction * (c[i+1] - c[i]) + c[i]
 
                 wi = wi_n
 
-            else:
-                return self._upper()
-        
+            return self._upper()
 
 
     def sample(self):
