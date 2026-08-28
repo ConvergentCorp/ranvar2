@@ -611,7 +611,12 @@ class RanVar():
         return fraction * (c[lo+1] - c[lo]) + c[lo]
 
 
-    def sample(self):
+    @ccall
+    @boundscheck(False)
+    @wraparound(False)
+    @cdivision(True)
+    @initializedcheck(False)
+    def sample(self) -> cdouble:
         """Sample a single value from the distribution represented by the digest.
 
         Draws a uniform probability and returns the quantile at that
