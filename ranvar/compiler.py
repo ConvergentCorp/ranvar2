@@ -37,6 +37,10 @@ BINOPS = {
     ast.Pow: '**',
 }
 
+# How many turns of a compiled while loop pass between checks for a pending
+# signal. Small enough that Ctrl-C feels immediate, large enough not to matter.
+SIGNAL_EVERY = 4096
+
 COMPARES = {
     ast.Lt: '<',
     ast.LtE: '<=',
@@ -62,6 +66,8 @@ class Translator():
         params (list): The model's own parameter names.
         free (list): Names read from the enclosing scope, in argument order.
         draws (set): Which of those names are RanVars and so can be drawn from.
+        counters (list): Loop variables, which are integers rather than doubles.
+        guards (int): How many while loops need a counter to pace signal checks.
         width (int): How many values the model returns, 0 meaning a single one
                    and None meaning no return has been seen yet.
     """
@@ -79,6 +85,12 @@ class Translator():
         self.free   = []
         self.draws  = set()
         self.width  = None
+
+        # Loop counters are integers rather than doubles, and each while loop
+        # gets a counter of its own to pace its signal checks by.
+        self.counters = []
+        self.guards   = 0
+        self.ranges   = set()
 
     # Analysis. ----------------------------------------------------------------
 
@@ -144,21 +156,33 @@ class Translator():
         # are part of the definition rather than of what runs, and naming a
         # decorator would otherwise look like a free variable of the model.
         for child in self.walk(node):
+            if isinstance(child, ast.For) and child.target.id not in self.counters:
+                self.counters.append(child.target.id)
+
+        for child in self.walk(node):
             if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store):
-                if child.id not in self.locals and child.id not in self.params:
+                if child.id in self.params or child.id in self.counters:
+                    continue
+
+                if child.id not in self.locals:
                     self.locals.append(child.id)
 
-        for name in self.params + self.locals:
+        for name in self.params + self.locals + self.counters:
             if name.startswith(RESERVED):
                 self.fail(node, f'{name!r} is reserved for the generated module')
 
-        known = set(self.params) | set(self.locals)
+        known = set(self.params) | set(self.locals) | set(self.counters)
+
+        # range is spelled like a name but is compiled as a loop, so it is not
+        # something to resolve from the surrounding scope.
+        skip = {id(child.func) for child in self.walk(node)
+                if isinstance(child, ast.Call) and id(child) in self.ranges}
 
         for child in self.walk(node):
             if not isinstance(child, ast.Name) or not isinstance(child.ctx, ast.Load):
                 continue
 
-            if child.id in known or child.id in self.free:
+            if child.id in known or child.id in self.free or id(child) in skip:
                 continue
 
             self.free.append(child.id)
@@ -175,12 +199,35 @@ class Translator():
         Raises:
             RanVarCompileError: If a statement or a call is outside the subset.
         """
+        # range() in a for loop is the one call that is a construct rather than
+        # a function, so it is noted here and skipped by the ban below.
+        for child in self.walk(node):
+            if isinstance(child, ast.For) and self.isRange(child.iter):
+                self.ranges.add(id(child.iter))
+
         for statement in node.body:
             self.statement(statement)
 
         for child in self.walk(node):
-            if isinstance(child, ast.Call):
+            if isinstance(child, ast.Call) and id(child) not in self.ranges:
                 self.fail(child, 'calling a function cannot be compiled')
+
+    def isRange(self, node):
+        """Report whether a node is a call to range().
+
+        Args:
+            node (ast.AST): The node to test.
+
+        Returns:
+            bool: True for a range() call.
+        """
+        return (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == 'range'
+            and not node.keywords
+            and 1 <= len(node.args) <= 3
+        )
 
     def statement(self, statement):
         """Check one statement, and anything nested inside it, is compilable.
@@ -197,7 +244,26 @@ class Translator():
 
             return
 
-        allowed = (ast.Expr, ast.Pass, ast.Assign, ast.AugAssign, ast.Return)
+        if isinstance(statement, (ast.For, ast.While)):
+            if statement.orelse:
+                self.fail(statement, 'the else clause of a loop cannot be compiled')
+
+            if isinstance(statement, ast.For):
+                if not self.isRange(statement.iter):
+                    self.fail(statement, 'a for loop can only run over range()')
+
+                if not isinstance(statement.target, ast.Name):
+                    self.fail(statement, 'a for loop can only bind a single name')
+
+            for child in statement.body:
+                self.statement(child)
+
+            return
+
+        allowed = (
+            ast.Expr, ast.Pass, ast.Assign, ast.AugAssign, ast.Return,
+            ast.Break, ast.Continue,
+        )
 
         if not isinstance(statement, allowed):
             self.fail(statement, f'{type(statement).__name__} cannot be compiled')
@@ -433,10 +499,81 @@ class Translator():
 
             return lines
 
+        if isinstance(node, ast.For):
+            bound = ', '.join(self.intExpr(arg) for arg in node.iter.args)
+
+            lines = [f'{pad}for {node.target.id} in range({bound}):']
+            lines.extend(self.block(node.body, level + 1))
+
+            return lines
+
+        if isinstance(node, ast.While):
+            return self.loop(node, level, pad)
+
+        if isinstance(node, ast.Break):
+            return [pad + 'break']
+
+        if isinstance(node, ast.Continue):
+            return [pad + 'continue']
+
         if isinstance(node, ast.Return):
             return self.returns(node, pad)
 
         self.fail(node, f'{type(node).__name__} cannot be compiled')
+
+    def loop(self, node, level, pad):
+        """Translate a while loop.
+
+        A compiled loop holds the GIL and never returns to the interpreter, so a
+        condition that never goes false would hang the process with no way to
+        interrupt it. The generated loop therefore checks for pending signals
+        every so often, which is what lets Ctrl-C break out of one.
+
+        Args:
+            node (ast.While): The statement node.
+            level (int): Indentation depth inside the generated function.
+            pad (str): Leading indentation.
+
+        Returns:
+            list: The generated lines.
+        """
+        guard = f'{RESERVED}guard{self.guards}'
+        self.guards += 1
+
+        inner = '    '*(level + 1)
+
+        lines = [
+            f'{pad}{guard} = 0',
+            f'{pad}while {self.expr(node.test)}:',
+            f'{inner}{guard} = {guard} + 1',
+            '',
+            f'{inner}if {guard} >= {SIGNAL_EVERY}:',
+            f'{inner}    {guard} = 0',
+            f'{inner}    PyErr_CheckSignals()',
+            '',
+        ]
+        lines.extend(self.block(node.body, level + 1))
+
+        return lines
+
+    def intExpr(self, node):
+        """Translate an expression that has to be a whole number.
+
+        Everything else in a compiled model is a double, but a range bound is a
+        count, so a literal is emitted as an integer and anything else is
+        converted to one.
+
+        Args:
+            node (ast.AST): The expression node.
+
+        Returns:
+            str: The equivalent Cython expression, typed as an integer.
+        """
+        if isinstance(node, ast.Constant) and isinstance(node.value, int) \
+                and not isinstance(node.value, bool):
+            return repr(node.value)
+
+        return f'<long>({self.expr(node)})'
 
     def returns(self, node, pad):
         """Translate a return statement.
@@ -540,6 +677,7 @@ class Translator():
             '# Generated by ranvar.compiler. Edits here are overwritten.',
             f'# Model: {self.name}',
             '',
+            'from cpython.exc cimport PyErr_CheckSignals',
             'from ranvar.ranvar cimport RanVar',
             '',
             '',
@@ -557,6 +695,12 @@ class Translator():
 
         for name in self.locals:
             lines.append(f'    cdef double {name}')
+
+        for name in self.counters:
+            lines.append(f'    cdef long {name}')
+
+        for index in range(self.guards):
+            lines.append(f'    cdef long {RESERVED}guard{index}')
 
         lines.extend(body)
         lines.extend(['', ''])
@@ -800,10 +944,15 @@ class CompiledMonteCarlo():
     and the loop around it is compiled, so a call crosses into the interpreter
     once rather than once per sample.
 
-    The translation only covers arithmetic over numbers and draws from RanVars.
-    Anything else is refused when the model is compiled rather than run through
-    the interpreter, so a model either gets the speed the decorator is for or
-    says why it cannot.
+    The translation covers arithmetic over numbers, draws from RanVars,
+    assignment, if and else, for loops over range, while loops, break and
+    continue. Anything else is refused when the model is compiled rather than
+    run through the interpreter, so a model either gets the speed the decorator
+    is for or says why it cannot.
+
+    A compiled while loop checks for pending signals as it runs, so one whose
+    condition never goes false can still be interrupted rather than hanging the
+    process.
 
     Compiling takes several seconds, so it happens on the first call rather than
     at decoration, and the result is cached on disk and reused by later runs and
@@ -978,7 +1127,8 @@ def cfunc(fn=None, *, samples=DEFAULT_SAMPLES, maxBins=DEFAULT_MAXBINS):
     around it compiled, so the whole simulation runs without returning to the
     interpreter. In exchange the model has to stay within what can be turned
     into C: arithmetic over numbers, draws from RanVars with ~, assignments,
-    if and else, and a return of one value or a tuple of them.
+    if and else, for loops over range, while loops, break and continue, and a
+    return of one value or a tuple of them.
 
     Compiling takes several seconds and happens on the first call, not at
     decoration. The result is cached on disk under ~/.cache/ranvar and reused

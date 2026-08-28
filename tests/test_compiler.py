@@ -201,21 +201,10 @@ def test_rejects_unsupported_models():
     import math
 
     text = 'not a number'
+    things = [1.0, 2.0, 3.0]
 
     def callsAFunction():
         return math.sqrt(~source)
-
-    def hasALoop():
-        total = 0.0
-        for _ in range(3):
-            total += ~source
-        return total
-
-    def hasAWhile():
-        total = 0.0
-        while total < 5.0:
-            total += ~source
-        return total
 
     def usesAString():
         return ~source + text
@@ -252,11 +241,32 @@ def test_rejects_unsupported_models():
     def readsAnUndefinedName():
         return ~source + missing
 
+    def loopsOverAList():
+        total = 0.0
+        for value in things:
+            total += value
+        return total
+
+    def loopsOverTwoNames():
+        total = 0.0
+        for first, second in range(3):
+            total += first
+        return total
+
+    def loopWithElse():
+        total = 0.0
+        for _ in range(3):
+            total += ~source
+        else:
+            total += 1.0
+        return total
+
     models = [
-        callsAFunction, hasALoop, hasAWhile, usesAString, neverReturns,
+        callsAFunction, usesAString, neverReturns,
         returnsNothing, branchesWithoutElse, disagreesOnWidth,
         chainsAComparison, usesAReservedName, usesFloorDivision,
         unpacksATuple, readsAnUndefinedName,
+        loopsOverAList, loopsOverTwoNames, loopWithElse,
     ]
 
     for model in models:
@@ -303,3 +313,136 @@ def test_metadata_is_preserved():
     assert documented.__name__ == 'documented'
     assert documented.__doc__ == 'A documented model.'
     assert documented.__wrapped__.__name__ == 'documented'
+
+
+def test_for_loop_is_compiled():
+    """Tests that a for loop over range is translated rather than refused."""
+    count = 4
+
+    @mc.cfunc(samples=1_000)
+    def summed():
+        total = 0.0
+
+        for i in range(count):
+            total += ~source
+
+        return total
+
+    @mc.func(samples=1_000)
+    def interpreted():
+        total = 0.0
+
+        for i in range(count):
+            total += ~source
+
+        return total
+
+    mc.seed(2468)
+    compiled = summed()
+
+    mc.seed(2468)
+    plain = interpreted()
+
+    assert compiled.mean() == plain.mean()
+    np.testing.assert_array_equal(compiled.getWeights(), plain.getWeights())
+
+
+def test_loop_counter_is_usable_as_a_number():
+    """Tests that the loop variable can be used in the model's arithmetic.
+
+    Counters are integers where everything else in a compiled model is a
+    double, so using one in an expression has to still give the right answer.
+    """
+
+    @mc.cfunc(samples=200)
+    def weighted():
+        total = 0.0
+
+        for i in range(4):
+            total += i * 2.0
+
+        return total
+
+    # 2*(0 + 1 + 2 + 3) is 12 on every run, so the digest holds one value.
+    assert weighted().mean() == 12.0
+
+
+def test_while_loop_is_compiled():
+    """Tests that a while loop is translated rather than refused."""
+
+    @mc.cfunc(samples=1_000)
+    def accumulate():
+        total = 0.0
+
+        while total < 300.0:
+            total += ~source
+
+        return total
+
+    @mc.func(samples=1_000)
+    def interpreted():
+        total = 0.0
+
+        while total < 300.0:
+            total += ~source
+
+        return total
+
+    mc.seed(1357)
+    compiled = accumulate()
+
+    mc.seed(1357)
+    plain = interpreted()
+
+    assert compiled.lower() >= 300.0
+    assert compiled.mean() == plain.mean()
+    np.testing.assert_array_equal(compiled.getWeights(), plain.getWeights())
+
+
+def test_break_and_continue_are_compiled():
+    """Tests that break and continue work inside a compiled loop."""
+
+    @mc.cfunc(samples=500)
+    def counted():
+        total = 0.0
+        seen = 0.0
+
+        for i in range(10):
+            if i < 2.0:
+                continue
+
+            if i > 5.0:
+                break
+
+            total += 1.0
+
+        return total
+
+    # i runs 2, 3, 4, 5 before the break, whatever the draws do.
+    assert counted().mean() == 4.0
+
+
+def test_elif_and_nested_ifs_are_compiled():
+    """Tests that an elif chain and a nested if both translate.
+
+    Python represents elif as an if nested in the else of the one before, so
+    this leans on the same translation as a plain else.
+    """
+
+    @mc.cfunc(samples=2_000)
+    def banded():
+        value = ~source
+
+        if value > 110.0:
+            band = 3.0
+        elif value > 100.0:
+            band = 2.0
+        else:
+            band = 1.0
+
+        return band
+
+    out = banded()
+
+    assert out.lower() >= 1.0
+    assert out.upper() <= 3.0
