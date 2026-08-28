@@ -466,3 +466,70 @@ def test_errors_from_the_model_are_not_swallowed():
 
     with pytest.raises(ValueError, match='inside the model'):
         raisesValue()
+
+
+def test_decorating_a_method():
+    """Tests that the wrapper binds as a method and reaches self.
+
+    A plain function is a descriptor, and that is what supplies self. The
+    wrapper is an object rather than a function, so binding is its own to do.
+    """
+    src = makeSource()
+
+    class Model():
+        def __init__(self, factor):
+            self.factor = factor
+
+        @mc.func(samples=200)
+        def scaled(self):
+            return ~src * self.factor
+
+    single = Model(1.0)
+    double = Model(2.0)
+
+    mc.seed(31337)
+    one = single.scaled()
+
+    mc.seed(31337)
+    two = double.scaled()
+
+    assert two.mean() == pytest.approx(2*one.mean(), rel=1e-9)
+
+
+def test_a_bound_method_keeps_the_wrapper_api():
+    """Tests that binding does not lose withSamples or the wrapper's settings."""
+    src = makeSource()
+
+    class Model():
+        @mc.func(samples=9, maxBins=16)
+        def draw(self):
+            return ~src
+
+    model = Model()
+
+    assert model.draw.samples == 9
+    assert model.draw.maxBins == 16
+    assert sum(model.draw().getWeights()) == 9
+    assert sum(model.draw.withSamples(4)().getWeights()) == 4
+
+
+def test_reaching_the_wrapper_through_the_class():
+    """Tests that the class attribute is the wrapper itself, unbound.
+
+    Reached that way the model keeps its own signature, so the instance is
+    passed explicitly the way an ordinary function would take it.
+    """
+    src = makeSource()
+
+    class Model():
+        def __init__(self, factor):
+            self.factor = factor
+
+        @mc.func(samples=50)
+        def scaled(self):
+            return ~src * self.factor
+
+    model = Model(3.0)
+
+    assert isinstance(Model.scaled, mc.decorators.MonteCarlo)
+    assert sum(Model.scaled(model).getWeights()) == 50

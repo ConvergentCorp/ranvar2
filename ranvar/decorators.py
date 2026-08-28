@@ -36,6 +36,66 @@ def _checkSamples(samples):
     return samples
 
 
+class Bound():
+    """A wrapper bound to the instance whose method it decorates.
+
+    A plain function is a descriptor, and that is what supplies self to a
+    method. The decorators are objects rather than functions, so binding is
+    theirs to do, and this is what their __get__ hands back.
+
+    Attributes:
+        wrapper (object): The decorator wrapping the method.
+        instance (object): The instance the method was reached through.
+    """
+
+    def __init__(self, wrapper, instance):
+        """Bind a wrapper to an instance.
+
+        Args:
+            wrapper (object): The decorator wrapping the method.
+            instance (object): The instance to pass as self.
+        """
+        self.wrapper  = wrapper
+        self.instance = instance
+
+    def __call__(self, *args, **kwargs):
+        """Run the simulation, passing the instance as the model's first argument.
+
+        Args:
+            *args: The remaining arguments for the model.
+            **kwargs: Keyword arguments for the model.
+
+        Returns:
+            RanVar: What the wrapper returns.
+        """
+        return self.wrapper(self.instance, *args, **kwargs)
+
+    def withSamples(self, samples):
+        """Get an equivalent binding that runs a different number of samples.
+
+        Args:
+            samples (int): Number of runs the result performs.
+
+        Returns:
+            Bound: The new wrapper, bound to the same instance.
+        """
+        return Bound(self.wrapper.withSamples(samples), self.instance)
+
+    def __getattr__(self, name):
+        """Fall back to the wrapper for anything binding does not change.
+
+        Args:
+            name (str): The attribute wanted.
+
+        Returns:
+            object: The wrapper's attribute.
+        """
+        return getattr(self.wrapper, name)
+
+    def __repr__(self):
+        return f'<Bound {self.wrapper!r} to {self.instance!r}>'
+
+
 class MonteCarlo():
     """A function wrapped in a monte carlo executor.
 
@@ -109,6 +169,23 @@ class MonteCarlo():
             RanVar: The distribution of the results.
         """
         return self._run(self.samples, args, kwargs)
+
+    def __get__(self, instance, owner=None):
+        """Bind the wrapper when it decorates a method.
+
+        Args:
+            instance (object): The instance the attribute was reached through,
+                             or None when reached through the class.
+            owner (type, optional): The class the attribute was found on.
+
+        Returns:
+            object: This wrapper when reached through the class, otherwise one
+                  bound to the instance.
+        """
+        if instance is None:
+            return self
+
+        return Bound(self, instance)
 
     def withSamples(self, samples):
         """Get an equivalent wrapper that runs a different number of samples.

@@ -11,7 +11,7 @@ import sys
 import tempfile
 import textwrap
 
-from ranvar.decorators import DEFAULT_MAXBINS, DEFAULT_SAMPLES, _checkSamples
+from ranvar.decorators import Bound, DEFAULT_MAXBINS, DEFAULT_SAMPLES, _checkSamples
 from ranvar.ranvar import RanVar
 
 
@@ -83,6 +83,8 @@ class Model():
 
         self.signature(node)
         self.scope(node)
+
+        self.attributes(node)
 
         node.decorator_list = []
         node = Draws(self.digests).visit(node)
@@ -232,6 +234,37 @@ class Model():
                     continue
 
                 stack.append(child)
+
+    def attributes(self, node):
+        """Refuse a draw from something reached through an attribute.
+
+        ~self.digest is the method shaped version of drawing from a module level
+        name: it compiles, but the attribute is a Python object to Cython, so it
+        is not the C call the decorator exists to give. Unlike a module level
+        name there is no value to inspect at compile time, so the shape of the
+        expression is what it is judged on.
+
+        Args:
+            node (ast.FunctionDef): The model's definition.
+
+        Raises:
+            RanVarCompileError: If ~ is applied to an attribute.
+        """
+        for child in self.body(node):
+            if not isinstance(child, ast.UnaryOp) or not isinstance(child.op, ast.Invert):
+                continue
+
+            if not isinstance(child.operand, ast.Attribute):
+                continue
+
+            drawn = ast.unparse(child.operand)
+
+            self.fail(
+                f'~{drawn} draws from an attribute. A compiled model has to take '
+                f'its digests as parameters annotated RanVar, so that drawing '
+                f'from them compiles to a C call. If {drawn} is a number rather '
+                f'than a digest, assign it to a local first'
+            )
 
     def lookup(self, name):
         """Look a name up in the scope the model was defined in.
@@ -666,6 +699,23 @@ class CompiledMonteCarlo():
                   model returning several values.
         """
         return self._run(self.samples, args, kwargs)
+
+    def __get__(self, instance, owner=None):
+        """Bind the wrapper when it decorates a method.
+
+        Args:
+            instance (object): The instance the attribute was reached through,
+                             or None when reached through the class.
+            owner (type, optional): The class the attribute was found on.
+
+        Returns:
+            object: This wrapper when reached through the class, otherwise one
+                  bound to the instance.
+        """
+        if instance is None:
+            return self
+
+        return Bound(self, instance)
 
     def withSamples(self, samples):
         """Get an equivalent wrapper that runs a different number of samples.

@@ -302,3 +302,54 @@ def test_metadata_is_preserved():
     assert documented.__name__ == 'documented'
     assert documented.__doc__ == 'A documented model.'
     assert documented.__wrapped__.__name__ == 'documented'
+
+
+def test_decorating_a_method():
+    """Tests that a compiled model can be a method.
+
+    self stays an ordinary Python object, which costs nothing while the model
+    does not read digests off it: it is touched once per call rather than once
+    per sample.
+    """
+
+    class Model():
+        def __init__(self, factor):
+            self.factor = factor
+
+        @mc.cfunc(samples=500)
+        def scaled(self, x: mc.RanVar, factor: cython.double) -> cython.double:
+            return ~x * factor
+
+    model = Model(2.0)
+
+    mc.seed(31337)
+    single = model.scaled(source, 1.0)
+
+    mc.seed(31337)
+    double = model.scaled(source, 2.0)
+
+    assert double.mean() == pytest.approx(2*single.mean(), rel=1e-9)
+    assert model.scaled.samples == 500
+    assert sum(model.scaled.withSamples(20)(source, 1.0).getWeights()) == 20
+
+
+def test_rejects_drawing_from_an_attribute():
+    """Tests that ~self.digest is refused the way a module level digest is.
+
+    An attribute is a Python object to Cython whatever it holds, so the draw
+    would compile without being the C call the decorator is for. There is no
+    value to inspect at compile time, so it is the shape that is judged.
+    """
+
+    class Model():
+        def __init__(self, digest):
+            self.digest = digest
+
+        @mc.cfunc(samples=10)
+        def drawsFromSelf(self) -> cython.double:
+            return ~self.digest
+
+    model = Model(source)
+
+    with pytest.raises(mc.RanVarCompileError):
+        model.drawsFromSelf()
