@@ -224,3 +224,245 @@ def test_rejects_a_non_numeric_result():
 
     with pytest.raises(TypeError):
         model()
+
+
+def test_multiple_outputs_give_a_ranvar_each():
+    """Tests that a function returning a tuple is collected into one RanVar each."""
+    src = makeSource()
+
+    @mc.func(samples=200)
+    def model():
+        return ~src, ~src, ~src
+
+    out = model()
+
+    assert isinstance(out, tuple)
+    assert len(out) == 3
+    assert all(isinstance(o, mc.RanVar) for o in out)
+
+
+def test_multiple_outputs_unpack():
+    """Tests that the results unpack the way the return statement reads."""
+    src = makeSource()
+
+    @mc.func(samples=200)
+    def model():
+        return ~src, ~src
+
+    first, second = model()
+
+    assert isinstance(first, mc.RanVar)
+    assert isinstance(second, mc.RanVar)
+
+
+def test_each_output_collects_its_own_value():
+    """Tests that values are collected into the digest for their own position."""
+    src = makeSource()
+
+    @mc.func(samples=200)
+    def model():
+        v = ~src
+        return v, v + 1000.0
+
+    low, high = model()
+
+    # mean() is exact, so the offset survives the collection intact.
+    assert abs((high.mean() - low.mean()) - 1000.0) < 1e-9
+
+
+def test_namedtuple_is_preserved():
+    """Tests that named outputs come back under the same names."""
+    from collections import namedtuple
+
+    Result = namedtuple('Result', 'revenue profit')
+    src = makeSource()
+
+    @mc.func(samples=200)
+    def model():
+        revenue = ~src
+        return Result(revenue=revenue, profit=revenue - 50.0)
+
+    out = model()
+
+    assert isinstance(out, Result)
+    assert out._fields == ('revenue', 'profit')
+    assert isinstance(out.revenue, mc.RanVar)
+    assert abs((out.revenue.mean() - out.profit.mean()) - 50.0) < 1e-9
+
+
+def test_list_output_stays_a_list():
+    """Tests that the results come back in the shape the function returned."""
+    src = makeSource()
+
+    @mc.func(samples=100)
+    def model():
+        return [~src, ~src]
+
+    out = model()
+
+    assert isinstance(out, list)
+    assert len(out) == 2
+
+
+def test_single_element_tuple_keeps_its_shape():
+    """Tests that a one value tuple is not unwrapped into a bare RanVar."""
+    src = makeSource()
+
+    @mc.func(samples=100)
+    def model():
+        return (~src,)
+
+    out = model()
+
+    assert isinstance(out, tuple)
+    assert len(out) == 1
+
+
+def test_single_output_is_not_wrapped():
+    """Tests that returning a bare number still gives a bare RanVar."""
+    src = makeSource()
+
+    @mc.func(samples=100)
+    def model():
+        return ~src
+
+    assert isinstance(model(), mc.RanVar)
+
+
+def test_multiple_outputs_run_the_function_once_per_sample():
+    """Tests that deciding the shape does not cost an extra run.
+
+    The first run is what reveals how many values there are, so it has to be
+    counted as the first sample rather than run again.
+    """
+    for samples in [1, 2, 5, 100]:
+        calls = []
+
+        @mc.func(samples=samples)
+        def model():
+            calls.append(1)
+            return 1.0, 2.0
+
+        out = model()
+
+        assert len(calls) == samples, \
+            f'{samples} samples ran the function {len(calls)} times'
+
+        for o in out:
+            assert sum(o.getWeights()) == samples
+
+
+def test_multiple_outputs_honour_maxBins():
+    """Tests that maxBins applies to every returned RanVar."""
+    src = makeSource()
+
+    @mc.func(samples=2_000, maxBins=16)
+    def model():
+        return ~src, ~src
+
+    assert [o.getActiveBinCount() for o in model()] == [16, 16]
+
+
+def test_multiple_outputs_with_withSamples():
+    """Tests that the sample count override works for multiple outputs too."""
+    calls = []
+
+    @mc.func(samples=9)
+    def model():
+        calls.append(1)
+        return 1.0, 2.0
+
+    out = model.withSamples(4)()
+
+    assert len(calls) == 4
+    assert len(out) == 2
+    assert all(sum(o.getWeights()) == 4 for o in out)
+
+
+def test_rejects_a_changing_number_of_outputs():
+    """Tests that the shape has to be the same on every run.
+
+    Collecting runs of different widths would quietly mix different quantities
+    into the same distribution.
+    """
+    state = {'n': 0}
+
+    @mc.func(samples=10)
+    def widens():
+        state['n'] += 1
+        return (1.0, 2.0) if state['n'] < 5 else (1.0, 2.0, 3.0)
+
+    with pytest.raises(ValueError):
+        widens()
+
+    state['n'] = 0
+
+    @mc.func(samples=10)
+    def toScalar():
+        state['n'] += 1
+        return (1.0, 2.0) if state['n'] < 5 else 1.0
+
+    with pytest.raises(ValueError):
+        toScalar()
+
+    state['n'] = 0
+
+    @mc.func(samples=10)
+    def toTuple():
+        state['n'] += 1
+        return 1.0 if state['n'] < 5 else (1.0, 2.0)
+
+    with pytest.raises(ValueError):
+        toTuple()
+
+
+def test_rejects_an_empty_result():
+    """Tests that a function returning nothing to collect is refused."""
+
+    @mc.func(samples=5)
+    def model():
+        return ()
+
+    with pytest.raises(ValueError):
+        model()
+
+
+def test_rejects_a_non_numeric_output():
+    """Tests that a bad value inside a tuple is reported, not just a bad tuple."""
+
+    @mc.func(samples=5)
+    def model():
+        return 1.0, 'not a number'
+
+    with pytest.raises(TypeError):
+        model()
+
+    @mc.func(samples=5)
+    def nested():
+        return 1.0, (2.0, 3.0)
+
+    with pytest.raises(TypeError):
+        nested()
+
+
+def test_errors_from_the_model_are_not_swallowed():
+    """Tests that an exception raised by the model itself propagates unchanged.
+
+    The single output loop catches TypeError and ValueError to report an
+    uncollectable result, so it has to tell those apart from the same errors
+    coming out of the model.
+    """
+
+    @mc.func(samples=5)
+    def raisesType():
+        raise TypeError('inside the model')
+
+    with pytest.raises(TypeError, match='inside the model'):
+        raisesType()
+
+    @mc.func(samples=5)
+    def raisesValue():
+        raise ValueError('inside the model')
+
+    with pytest.raises(ValueError, match='inside the model'):
+        raisesValue()
