@@ -818,6 +818,12 @@ class CompiledMonteCarlo():
         return tuple(outs)
 
     def __repr__(self):
+        """Describe this wrapper, for debugging.
+
+        Returns:
+            str: The wrapped model's name, the wrapper's settings, and whether
+               it has been compiled yet.
+        """
         state = 'compiled' if self.module is not None else 'not compiled yet'
 
         return (

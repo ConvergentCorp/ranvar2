@@ -492,6 +492,17 @@ class RanVar():
         pass
 
     def ccdf(self, x):
+        """Compute the complementary cumulative distribution function at a point.
+
+        Args:
+            x (float): The point at which to evaluate the CCDF.
+
+        Returns:
+            float: 1 minus the CDF at x.
+
+        Raises:
+            ValueError: If the digest is empty.
+        """
         return 1 - self.cdf(x)
 
     def dcdf(self, k):
@@ -669,8 +680,13 @@ class RanVar():
 
 
     def __invert__(self):
-        """
-        Syntactic sugar for the sample method.
+        """Syntactic sugar for the sample method.
+
+        Returns:
+            float: A value drawn from the distribution, as sample() would give.
+
+        Raises:
+            ValueError: If the digest is empty.
         """
         return self.sample()
 

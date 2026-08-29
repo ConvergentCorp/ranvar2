@@ -93,6 +93,11 @@ class Bound():
         return getattr(self.wrapper, name)
 
     def __repr__(self):
+        """Describe this binding, for debugging.
+
+        Returns:
+            str: The wrapped decorator and the instance it is bound to.
+        """
         return f'<Bound {self.wrapper!r} to {self.instance!r}>'
 
 
@@ -430,6 +435,11 @@ class MonteCarlo():
         return tuple(outs)
 
     def __repr__(self):
+        """Describe this wrapper, for debugging.
+
+        Returns:
+            str: The wrapped function's name and the wrapper's settings.
+        """
         return (
             f'<MonteCarlo {self.__name__} '
             f'samples={self.samples} maxBins={self.maxBins}>'
