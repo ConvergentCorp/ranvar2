@@ -157,10 +157,21 @@ class Model():
 
             self.params.append(arg.arg)
 
+            # Cython can only resolve this annotation to the bare name the
+            # generated module cimports, not to however the model happened to
+            # qualify it (mc.RanVar, after `import ranvar2 as mc`, say): an
+            # annotation it cannot resolve is accepted anyway, silently, as an
+            # ordinary (untyped) parameter rather than raising -- so a
+            # qualified name compiles and runs, just without the direct C
+            # call annotating it as RanVar was for. Normalising it here, on
+            # the node this function's own signature will later be unparsed
+            # from, is what makes every way of spelling it compile the same.
             if isRanVar(arg.annotation):
                 self.digests.append(arg.arg)
+                arg.annotation = ast.Name(id='RanVar', ctx=ast.Load())
             elif isRanVarArray(arg.annotation):
                 self.arrays.append(arg.arg)
+                arg.annotation = ast.Name(id='RanVarArray', ctx=ast.Load())
 
         self.annotations = {
             arg.arg: ast.unparse(arg.annotation) if arg.annotation else None

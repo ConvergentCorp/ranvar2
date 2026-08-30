@@ -578,3 +578,46 @@ def test_rejects_drawing_from_a_ranvar_array_slice():
 
     with pytest.raises(mc.RanVarCompileError):
         mc.cfunc(slicedInvert).compile()
+
+
+# Qualified annotations. ----------------------------------------------------
+#
+# `import ranvar2 as mc` and annotating a parameter `mc.RanVar` is natural,
+# and every test above does exactly that. Cython can only resolve an
+# annotation to a name its generated module actually cimports (RanVar /
+# RanVarArray, bare) -- a qualified one like `mc.RanVar` used to be silently
+# accepted as an ordinary, untyped parameter instead of raising, so the model
+# still ran and returned the right numbers, just without the direct C call
+# the annotation was supposed to buy it. These check the annotation the
+# generated source actually carries, not just that the answer comes out
+# right, since a correct-but-untyped compile would pass every test above too.
+
+def test_qualified_ranvar_annotation_compiles_to_the_bare_name():
+    """Tests that mc.RanVar in a model's own signature is normalised."""
+
+    def qualified(revenue: mc.RanVar) -> cython.double:
+        return ~revenue
+
+    model = mc.cfunc(qualified).compile().model
+
+    assert 'revenue: RanVar' in model.source
+    assert 'mc.RanVar' not in model.source
+    assert model.digests == ['revenue']
+
+
+def test_qualified_ranvar_array_annotation_compiles_to_the_bare_name():
+    """Tests that mc.RanVarArray in a model's own signature is normalised."""
+
+    def qualified(regions: mc.RanVarArray) -> cython.double:
+        total: cython.double = 0.0
+
+        for r in regions:
+            total += ~r
+
+        return total
+
+    model = mc.cfunc(qualified).compile().model
+
+    assert 'regions: RanVarArray' in model.source
+    assert 'mc.RanVarArray' not in model.source
+    assert model.arrays == ['regions']
