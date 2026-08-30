@@ -54,24 +54,25 @@ for yet — while still running at C speed inside a `@cfunc` model.
 ## Installation
 
 This is a private repo, not published to PyPI — install directly from
-GitHub over SSH (or an HTTPS URL that carries credentials, e.g. via `gh
-auth setup-git`), as an org member with access. With
-[uv](https://docs.astral.sh/uv/):
+GitHub, as an org member with access. With [uv](https://docs.astral.sh/uv/):
 
 ```sh
-uv add git+ssh://git@github.com/ConvergentCorp/ranvar2.git
+uv add git+https://github.com/ConvergentCorp/ranvar2.git
 ```
 
 Or with pip:
 
 ```sh
-pip install git+ssh://git@github.com/ConvergentCorp/ranvar2.git
+pip install git+https://github.com/ConvergentCorp/ranvar2.git
 ```
 
-To pin a specific commit or tag, append `@<ref>` to the URL. If you'd rather
-use HTTPS, `gh auth setup-git` configures git to authenticate GitHub HTTPS
-URLs with your `gh` login, so `git+https://github.com/ConvergentCorp/ranvar2.git`
-works too.
+The HTTPS URL needs git to be able to authenticate to GitHub with your
+account; if you use the [`gh` CLI](https://cli.github.com/), `gh auth
+login` followed by `gh auth setup-git` sets that up. If you have an SSH key
+registered with GitHub instead, `git+ssh://git@github.com/ConvergentCorp/ranvar2.git`
+works the same way.
+
+To pin a specific commit or tag, append `@<ref>` to the URL.
 
 ## Quickstart
 
@@ -175,7 +176,7 @@ seed(1234)   # make every following draw in this process reproducible
 ## Development
 
 ```sh
-git clone git@github.com:ConvergentCorp/ranvar2.git
+git clone https://github.com/ConvergentCorp/ranvar2.git
 cd ranvar2
 uv sync
 uv run pytest
