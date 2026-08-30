@@ -63,6 +63,15 @@ cdef class NegBinom(RanVar):
     cpdef double quantile(self, double p)
 
 
+# Constant is degenerate: all of its weight sits on a single point, so it only
+# needs that point on top of what RanVar already carries.
+cdef class Constant(RanVar):
+    cdef double _value
+
+    cpdef double sample(self)
+    cpdef double quantile(self, double p)
+
+
 # RanVarArray only needs _at() declared here: it is the one method
 # ranvar2.compiler's generated loops call, so it is the one that has to reach
 # RanVar._sample through the vtable rather than through Python attribute

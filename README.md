@@ -38,10 +38,11 @@ draw from one or more `RanVar`s become Monte Carlo models via a decorator:
   interpreter. The first call compiles and caches the result; later calls
   (in this process or a later one) reuse it.
 
-`Normal` and `NegBinom` are `RanVar` subclasses that draw directly from a
-fixed distribution's own formula instead of a fitted digest, so they can be
-used as model inputs — a prior, an assumption, anything you don't have data
-for yet — while still running at C speed inside a `@cfunc` model.
+`Normal`, `NegBinom` and `Constant` are `RanVar` subclasses that draw
+directly from a fixed distribution's own formula instead of a fitted digest,
+so they can be used as model inputs — a prior, an assumption, a value held
+fixed, anything you don't have data for yet — while still running at C speed
+inside a `@cfunc` model.
 
 ## Requirements
 
@@ -135,17 +136,18 @@ def bothDice() -> None:
 first, second = bothDice()
 ```
 
-### `Normal` and `NegBinom`: parametric inputs
+### `Normal`, `NegBinom` and `Constant`: parametric inputs
 
 Use these where you have an assumption or a prior rather than data to fit a
-digest to. Both subclass `RanVar`, so they work anywhere a `RanVar` does,
+digest to. All subclass `RanVar`, so they work anywhere a `RanVar` does,
 including as a `@cfunc` model parameter — sampling still costs one C call.
 
 ```python
-from ranvar2 import Normal, NegBinom, RanVar, cfunc
+from ranvar2 import Normal, NegBinom, Constant, RanVar, cfunc
 
 demand  = Normal(mean=500.0, std=50.0)
 defects = NegBinom(mean=3.0, dispersion=0.8)  # variance = mean + dispersion * mean**2
+price   = Constant(value=19.99)               # degenerate: every draw is 19.99
 
 @cfunc(samples=200_000)
 def shortfall(capacity: cython.double, demand: RanVar) -> cython.double:
@@ -155,12 +157,21 @@ def shortfall(capacity: cython.double, demand: RanVar) -> cython.double:
 shortfall(450.0, demand).mean()
 ```
 
+`Constant` is the degenerate distribution: all of its weight sits on one
+point, so it puts a plain number in a slot that has to be a `RanVar` — a
+scenario held fixed, an assumption not yet given a spread — without the model
+having to special case it.
+
 `fit(x)` re-estimates a `Normal`/`NegBinom`'s parameters from data by the
 method of moments (needs at least 2 points); `add()` is refused, since a
-single point can't estimate a spread. Methods with no closed form in terms
-of standard C `math.h` functions (`Normal.quantile()`,
+single point can't estimate a spread. `Constant` is the exception on both
+counts: `fit(x)` takes its value from the sample mean of as little as one
+point, and `add(point)` replaces the value outright, since one point does
+fully determine a constant. Methods with no closed form in terms of standard
+C `math.h` functions (`Normal.quantile()`,
 `NegBinom.cdf()`/`ccdf()`/`dcdf()`/`dccdf()`/`quantile()`) raise
-`NotImplementedError` rather than silently reading an unrelated digest.
+`NotImplementedError` rather than silently reading an unrelated digest, as do
+`Constant.dcdf()`/`dccdf()`, whose CDF is a step with no density.
 
 ### `RanVarArray`: a collection of digests
 
@@ -213,8 +224,8 @@ Only these two patterns — a bare `RanVarArray` parameter iterated directly,
 or indexed with a single expression — are rewritten; unpacking, or slicing
 the array first, still works, just as ordinary Python.
 
-Every element has to be a `RanVar` (`Normal` and `NegBinom` included, since
-both subclass it) — checked on `fromList()`, the plain constructor, and
+Every element has to be a `RanVar` (`Normal`, `NegBinom` and `Constant`
+included, since they all subclass it) — checked on `fromList()`, the plain constructor, and
 every mutation. `~regions` and `~regions[1:3]` (drawing from the whole array
 or a slice of it, rather than a single element) and reading a `RanVarArray`
 from the surrounding module (rather than taking it as a parameter) are all
@@ -223,7 +234,8 @@ refused for the same reason a bare `RanVar` would be.
 ### Reproducibility
 
 Sampling draws from a single process-global C generator (`rand()`/`srand()`
-under the hood), shared by every `RanVar`, `Normal`, and `NegBinom`:
+under the hood), shared by every `RanVar`, `Normal`, and `NegBinom`
+(`Constant` draws nothing, so it is unaffected):
 
 ```python
 from ranvar2 import seed

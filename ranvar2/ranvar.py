@@ -912,7 +912,7 @@ def _samplePoisson(lam: cdouble) -> cdouble:
 
 # Parametric distributions. -----------------------------------------------------
 #
-# Both subclass RanVar so a compiled model can still take them through a
+# All subclass RanVar so a compiled model can still take them through a
 # parameter annotated RanVar: sample() is declared cpdef in ranvar.pxd, so
 # overriding it here gets dispatched through the vtable at the C level, the
 # same as any other virtual method, with no Python call involved.
@@ -1411,6 +1411,205 @@ class NegBinom(RanVar):
         )
 
 
+@cclass
+class Constant(RanVar):
+    """A digest that always returns a fixed value instead of data.
+
+    The degenerate distribution: all of its weight sits on a single point,
+    so sample() returns that point rather than drawing anything, and every
+    quantile of it is that same point. Useful wherever a model wants a plain
+    number in a slot that has to be a RanVar -- a scenario held fixed, an
+    assumption not yet given a spread -- without special casing the model.
+
+    Unlike Normal and NegBinom, add() is supported here: a single point does
+    fully determine a constant, so adding one just replaces the value.
+    """
+    _value: cdouble
+
+    def __init__(self, value=0.0, maxBins=32):
+        """Create a digest fixed at one value.
+
+        Args:
+            value (float, optional): The value every draw returns. Defaults
+                                   to 0.0.
+            maxBins (int, optional): Passed through to RanVar. Unused by
+                                   Constant itself, since neither add() nor
+                                   fit() builds a digest here. Defaults to 32.
+        """
+        super().__init__(maxBins=maxBins)
+
+        self._value = value
+
+    @ccall
+    def sample(self) -> cdouble:
+        """Return the fixed value.
+
+        Returns:
+            float: The value, the only one this distribution takes.
+        """
+        return self._value
+
+    def value(self):
+        """Return the fixed value.
+
+        Returns:
+            float: The value, from construction or the last add()/fit().
+        """
+        return self._value
+
+    def mean(self):
+        """Return this distribution's mean.
+
+        Unlike RanVar.mean(), which averages the fitted centroids, this
+        returns the value Constant currently holds, from construction or the
+        last add()/fit(), since sample() returns that value rather than
+        drawing from any digest.
+
+        Returns:
+            float: The value, which is also its mean.
+        """
+        return self._value
+
+    def add(self, point, count=1.0):
+        """Replace the value with a single point.
+
+        RanVar.add() appends one weighted observation to a t-digest. A
+        constant has room for only one point, so this replaces the value
+        outright instead. count is ignored: a degenerate distribution puts
+        all of its weight on that one point however it is weighted.
+
+        Args:
+            point (float): The new value.
+            count (float, optional): Ignored. Accepted only to match
+                                   RanVar.add()'s signature. Defaults to 1.0.
+        """
+        self._value = point
+
+    def fit(self, x):
+        """Re-estimate the value from data as its sample mean.
+
+        Unlike RanVar.fit(), which adds every point to a t-digest, this
+        replaces Constant's own value outright with the mean of x, the
+        method of moments estimator for a degenerate distribution's single
+        parameter. Unlike Normal.fit() and NegBinom.fit(), one point is
+        enough, since there is no spread to estimate.
+
+        Args:
+            x (iterable): Data to estimate the value from. Needs at least 1
+                         point.
+
+        Raises:
+            ValueError: If x is empty.
+        """
+        values = list(x)
+        n      = len(values)
+
+        if n < 1:
+            raise ValueError('fit() needs at least 1 point to estimate a value')
+
+        self._value = sum(values) / n
+
+    def lower(self):
+        """Return this distribution's lower support bound.
+
+        Unlike RanVar.lower(), which reads the smallest fitted centroid, this
+        is the bound of Constant's own support, which is the single point it
+        sits on.
+
+        Returns:
+            float: The value.
+        """
+        return self._value
+
+    def upper(self):
+        """Return this distribution's upper support bound.
+
+        Returns:
+            float: The value, the same as lower(), since the support is a
+                 single point.
+        """
+        return self._value
+
+    def cdf(self, k):
+        """Compute the CDF of the degenerate distribution at a point.
+
+        A step: nothing is below the value, everything is at or below it
+        from the value onwards.
+
+        Args:
+            k (float): The point to evaluate the CDF at.
+
+        Returns:
+            float: 0.0 below the value, 1.0 at or above it.
+        """
+        return 1.0 if k >= self._value else 0.0
+
+    def ccdf(self, x):
+        """Compute the complementary CDF at a point.
+
+        Args:
+            x (float): The point to evaluate the CCDF at.
+
+        Returns:
+            float: 1.0 below the value, 0.0 at or above it, the probability
+                 of drawing more than x.
+        """
+        return 1.0 if x < self._value else 0.0
+
+    def dcdf(self, k):
+        """Not implemented: a degenerate distribution has no density.
+
+        RanVar.dcdf() estimates a density from the piecewise-linear digest
+        CDF. Constant's CDF is a single step instead, whose derivative is
+        zero everywhere except at the value, where it is a Dirac delta rather
+        than a number, so there is nothing analogous to return.
+
+        Raises:
+            NotImplementedError: Always.
+        """
+        raise NotImplementedError(
+            'Constant.dcdf() is not defined: a constant is degenerate, so '
+            'its CDF is a step with no derivative at the value it steps at.'
+        )
+
+    def dccdf(self, k):
+        """Not implemented, for the same reason as dcdf().
+
+        Raises:
+            NotImplementedError: Always.
+        """
+        raise NotImplementedError(
+            'Constant.dccdf() is not defined, for the same reason as '
+            'Constant.dcdf().'
+        )
+
+    @ccall
+    def quantile(self, p: cdouble) -> cdouble:
+        """Return the quantile for a given probability.
+
+        Every quantile of a degenerate distribution is the point it sits on,
+        so p is ignored, rather than RanVar.quantile()'s search through a
+        fitted digest's cumulative weight ladder.
+
+        Args:
+            p (float): Probability value. Ignored.
+
+        Returns:
+            float: The value.
+        """
+        return self._value
+
+    def __reduce__(self):
+        """Support pickling and copying.
+
+        Returns:
+            tuple: The (callable, args, state) triple pickle expects.
+        """
+        return (
+            type(self), (self._value, self.maxBins),
+            (self.nActive, self.bins, self.cnts),
+        )
+
 # A collection of digests. -----------------------------------------------------
 
 @cclass
@@ -1421,8 +1620,8 @@ class RanVarArray():
     one -- one per region, one per product line -- and RanVarArray is what
     lets a model take that as one parameter instead of *args. It behaves like
     an ordinary list (indexing, slicing, append, len, +, iteration, ...), and
-    every element has to be a RanVar (Normal and NegBinom included, since both
-    subclass it), checked on insertion.
+    every element has to be a RanVar (Normal, NegBinom and Constant included,
+    since they all subclass it), checked on insertion.
 
     Its other job is letting ranvar2.compiler compile a loop over it: `for x
     in arr:` inside a @cfunc model, where arr is a parameter annotated
@@ -1491,7 +1690,7 @@ class RanVarArray():
         if not isinstance(item, RanVar):
             raise TypeError(
                 f'RanVarArray only holds RanVar instances (Normal, NegBinom, '
-                f'... included, since both subclass it), got '
+                f'Constant, ... included, since they all subclass it), got '
                 f'{type(item).__name__!r}'
             )
 

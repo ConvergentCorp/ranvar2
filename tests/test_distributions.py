@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 import ranvar2 as mc
-from ranvar2 import RanVar, Normal, NegBinom
+from ranvar2 import RanVar, Normal, NegBinom, Constant
 
 
 # Models are written once and shared, since each distinct one costs a compile.
@@ -352,11 +352,141 @@ def test_negbinom_fit_rejects_data_with_no_valid_dispersion(data):
         NegBinom(mean=1.0, dispersion=1.0).fit(data)
 
 
+# Constant. ------------------------------------------------------------------
+
+def test_constant_is_a_ranvar():
+    """Tests that Constant can be used anywhere a RanVar is expected."""
+    assert isinstance(Constant(value=1.0), RanVar)
+
+
+def test_constant_accessors():
+    """Tests that value()/mean() return the constructor's parameter."""
+    c = Constant(value=7.5)
+
+    assert c.value() == 7.5
+    assert c.mean()  == 7.5
+
+
+def test_constant_defaults_to_zero():
+    """Tests that a Constant built with no arguments sits at 0.0."""
+    assert Constant().sample() == 0.0
+
+
+def test_constant_sample_never_varies():
+    """Tests that every draw returns the same value, seed regardless."""
+    mc.seed(6)
+
+    c = Constant(value=-3.25)
+
+    assert all(c.sample() == -3.25 for _ in range(1_000))
+
+
+def test_constant_pickles_to_the_same_class():
+    """Tests that a Constant round trips through pickle as a Constant, with
+    its value intact, rather than unpickling to the plain RanVar base.
+    """
+    c  = Constant(value=4.0)
+    c2 = pickle.loads(pickle.dumps(c))
+
+    assert type(c2) is Constant
+    assert c2.value() == 4.0
+
+    c3 = pickle.loads(pickle.dumps(c2))
+    assert type(c3) is Constant
+
+
+def test_constant_compiles_through_a_ranvar_annotated_model():
+    """Tests that a compiled model draws from Constant's own sample()."""
+    mc.seed(7)
+
+    out = compiledIdentity(Constant(value=12.0))
+
+    mean, var = empiricalMoments(out)
+
+    assert mean == pytest.approx(12.0)
+    assert var  == pytest.approx(0.0, abs=1e-9)
+
+
+def test_constant_lower_upper_are_the_value():
+    """Tests that the support is the single point, with no data added."""
+    c = Constant(value=2.0)
+
+    assert c.lower() == 2.0
+    assert c.upper() == 2.0
+
+
+def test_constant_quantile_is_the_value_everywhere():
+    """Tests that every quantile of a degenerate distribution is its point,
+    including at and outside the ends of the probability range.
+    """
+    c = Constant(value=5.0)
+
+    for p in (0.0, 0.01, 0.5, 0.99, 1.0, -1.0, 2.0):
+        assert c.quantile(p) == 5.0
+
+
+def test_constant_cdf_is_a_step():
+    """Tests that cdf()/ccdf() step at the value rather than reading the
+    (empty) inherited digest.
+    """
+    c = Constant(value=5.0)
+
+    assert c.cdf(4.999) == 0.0
+    assert c.cdf(5.0)   == 1.0
+    assert c.cdf(5.001) == 1.0
+
+    assert c.ccdf(4.999) == 1.0
+    assert c.ccdf(5.0)   == 0.0
+    assert c.ccdf(5.001) == 0.0
+
+
+@pytest.mark.parametrize('method', ['dcdf', 'dccdf'])
+def test_constant_has_no_density(method):
+    """Tests that the density methods refuse, since a step CDF has no
+    derivative at the point it steps at.
+    """
+    c = Constant(value=5.0)
+
+    with pytest.raises(NotImplementedError):
+        getattr(c, method)(5.0)
+
+
+def test_constant_add_replaces_the_value():
+    """Tests that add() sets the value, unlike Normal/NegBinom, since one
+    point does fully determine a constant.
+    """
+    c = Constant(value=1.0)
+    c.add(8.0)
+
+    assert c.value()  == 8.0
+    assert c.sample() == 8.0
+
+
+def test_constant_fit_uses_the_sample_mean():
+    """Tests that fit() replaces the value with the mean of the data, and
+    that a single point is enough, unlike Normal/NegBinom.
+    """
+    c = Constant(value=0.0)
+    c.fit([2.0, 4.0, 6.0])
+
+    assert c.value() == pytest.approx(4.0)
+
+    c.fit([9.0])
+
+    assert c.value() == pytest.approx(9.0)
+
+
+def test_constant_fit_needs_at_least_one_point():
+    """Tests that fit() refuses an empty collection."""
+    with pytest.raises(ValueError):
+        Constant().fit([])
+
+
 # Every public RanVar method is present, whether inherited unchanged (the
 # ones with no data dependency), overridden analytically, or overridden to
 # refuse. Digest-only accessors (getActiveBinCount/getBins/getWeights) are
 # not part of this contract, since add()/fit() no longer build a digest for
-# either subclass. --------------------------------------------------------
+# any of these subclasses. ------------------------------------------------
 
 PUBLIC_METHODS = [
     'add', 'lower', 'upper', 'cdf', 'ccdf', 'dcdf', 'dccdf', 'quantile',
@@ -367,9 +497,10 @@ PUBLIC_METHODS = [
 @pytest.mark.parametrize('cls, kwargs', [
     (Normal, dict(mean=0.0, std=1.0)),
     (NegBinom, dict(mean=1.0, dispersion=1.0)),
+    (Constant, dict(value=1.0)),
 ])
 def test_all_public_ranvar_methods_are_present(cls, kwargs):
-    """Tests that neither subclass is missing a method RanVar exposes."""
+    """Tests that no subclass is missing a method RanVar exposes."""
     instance = cls(**kwargs)
 
     for name in PUBLIC_METHODS:
