@@ -68,7 +68,10 @@ Or with pip:
 pip install git+ssh://git@github.com/ConvergentCorp/ranvar2.git
 ```
 
-To pin a specific commit or tag, append `@<ref>` to the URL.
+To pin a specific commit or tag, append `@<ref>` to the URL. If you'd rather
+use HTTPS, `gh auth setup-git` configures git to authenticate GitHub HTTPS
+URLs with your `gh` login, so `git+https://github.com/ConvergentCorp/ranvar2.git`
+works too.
 
 ## Quickstart
 
