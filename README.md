@@ -147,6 +147,7 @@ from ranvar2 import Normal, NegBinom, Constant, RanVar, cfunc
 
 demand  = Normal(mean=500.0, std=50.0)
 defects = NegBinom(mean=3.0, dispersion=0.8)  # variance = mean + dispersion * mean**2
+retries = NegBinom(r=5.0, p=0.4)              # same thing, textbook parameterization
 price   = Constant(value=19.99)               # degenerate: every draw is 19.99
 
 @cfunc(samples=200_000)
@@ -156,6 +157,14 @@ def shortfall(capacity: cython.double, demand: RanVar) -> cython.double:
 
 shortfall(450.0, demand).mean()
 ```
+
+`NegBinom` takes either parameterization: `mean`/`dispersion` (NB2), or the
+textbook `r`/`p` — failures before the `r`-th success at success probability
+`p` — which is converted at construction and stored as
+`mean = r(1 - p)/p`, `dispersion = 1/r`. The two can't be mixed in one call,
+and everything past `__init__` (`mean()`, `dispersion()`, `fit()`, pickling)
+works in `mean`/`dispersion` only. `r` may be any positive real, not just an
+integer, since sampling goes through a Gamma-Poisson mixture.
 
 `Constant` is the degenerate distribution: all of its weight sits on one
 point, so it puts a plain number in a slot that has to be a `RanVar` — a

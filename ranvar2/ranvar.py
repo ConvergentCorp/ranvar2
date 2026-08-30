@@ -1151,6 +1151,11 @@ class NegBinom(RanVar):
     this is drawn as a Gamma-Poisson mixture, so dispersion may be any
     positive real rather than only 1/integer.
 
+    The textbook r/p parameterization -- the number of failures before the
+    r-th success, at success probability p -- is accepted as an alternative
+    at construction, and converted to mean and dispersion on the spot:
+    everything past __init__ works in mean/dispersion only.
+
     fit() re-estimates mean and dispersion analytically by inverting that
     same variance formula from a sample's moments, rather than accumulating
     points into a digest, and add() is refused outright, since a single
@@ -1162,8 +1167,14 @@ class NegBinom(RanVar):
     _shape: cdouble
     _scale: cdouble
 
-    def __init__(self, mean=1.0, dispersion=1.0, maxBins=32):
-        """Create a fixed NegBinom(mean, dispersion) digest.
+    def __init__(self, mean=None, dispersion=None, maxBins=32, r=None, p=None):
+        """Create a fixed NegBinom digest, in either parameterization.
+
+        Give either mean and dispersion (the NB2 form this class works in
+        throughout) or r and p (the textbook form), not a mix of the two.
+        r/p is converted here and stored as mean and dispersion, so nothing
+        downstream -- fit(), the accessors, pickling -- has to know which
+        form it was built from.
 
         Args:
             mean (float, optional): The distribution's mean count, must not
@@ -1173,11 +1184,49 @@ class NegBinom(RanVar):
                                         Defaults to 1.0.
             maxBins (int, optional): Passed through to RanVar. Unused by
                                    NegBinom itself, since neither add() nor
-                                   fit() builds a digest here. Defaults to 32.
+                                   fit() builds a digest here. Kept ahead of
+                                   r/p in the signature so that positional
+                                   calls (__reduce__ below among them) still
+                                   reach it. Defaults to 32.
+            r (float, optional): Number of successes to wait for, must be
+                               positive. Needs p alongside it. Any positive
+                               real, not only an integer, since the
+                               Gamma-Poisson mixture sample() draws from
+                               extends the distribution to real r.
+            p (float, optional): Probability of success on each trial, in
+                               (0, 1]. Needs r alongside it. p = 1 gives the
+                               degenerate distribution at 0.
 
         Raises:
-            ValueError: If mean is negative or dispersion is not positive.
+            ValueError: If both parameterizations are given, if only one of
+                      r/p is, if mean is negative, if dispersion is not
+                      positive, if r is not positive, or if p is outside
+                      (0, 1].
         """
+        if r is not None or p is not None:
+            if mean is not None or dispersion is not None:
+                raise ValueError(
+                    'NegBinom takes either mean/dispersion or r/p, not both'
+                )
+
+            if r is None or p is None:
+                raise ValueError('the r/p parameterization needs both r and p')
+
+            if r <= 0:
+                raise ValueError('r must be positive')
+
+            if p <= 0 or p > 1:
+                raise ValueError('p must be in (0, 1]')
+
+            # mean = r(1 - p)/p and variance = r(1 - p)/p**2, which is
+            # mean + mean**2/r, so dispersion (the NB2 coefficient on
+            # mean**2) is exactly 1/r.
+            mean       = r * (1.0 - p) / p
+            dispersion = 1.0 / r
+        else:
+            mean       = 1.0 if mean is None else mean
+            dispersion = 1.0 if dispersion is None else dispersion
+
         if mean < 0:
             raise ValueError('mean must not be negative')
 

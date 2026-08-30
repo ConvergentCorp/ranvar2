@@ -207,6 +207,75 @@ def test_negbinom_accessors():
     assert nb.dispersion() == 0.25
 
 
+def test_negbinom_accepts_the_r_p_parameterization():
+    """Tests that r/p is converted to mean/dispersion at construction.
+
+    mean = r(1 - p)/p and dispersion = 1/r, the NB2 form of the textbook
+    parameterization, and nothing downstream sees r or p.
+    """
+    nb = NegBinom(r=4.0, p=0.25)
+
+    assert nb.mean()       == pytest.approx(4.0 * 0.75 / 0.25)
+    assert nb.dispersion() == pytest.approx(1.0 / 4.0)
+
+
+def test_negbinom_r_p_sample_matches_the_textbook_moments():
+    """Tests that draws from an r/p NegBinom recover r(1 - p)/p and
+    r(1 - p)/p**2, the mean and variance that parameterization defines.
+    """
+    mc.seed(8)
+
+    r, p = 5.0, 0.4
+    nb   = NegBinom(r=r, p=p)
+    xs   = np.array([nb.sample() for _ in range(200_000)])
+
+    assert xs.mean() == pytest.approx(r * (1 - p) / p, rel=0.05)
+    assert xs.var()  == pytest.approx(r * (1 - p) / p ** 2, rel=0.08)
+
+
+def test_negbinom_r_p_pickles_as_mean_and_dispersion():
+    """Tests that an r/p NegBinom round trips, since it is stored (and so
+    reconstructed) in the mean/dispersion form.
+    """
+    nb  = NegBinom(r=3.0, p=0.5)
+    nb2 = pickle.loads(pickle.dumps(nb))
+
+    assert type(nb2) is NegBinom
+    assert nb2.mean()       == pytest.approx(nb.mean())
+    assert nb2.dispersion() == pytest.approx(nb.dispersion())
+
+
+def test_negbinom_p_of_one_is_degenerate():
+    """Tests that p = 1 gives the distribution that always draws zero, the
+    boundary of the r/p range.
+    """
+    mc.seed(9)
+
+    nb = NegBinom(r=2.0, p=1.0)
+
+    assert nb.mean() == 0.0
+    assert all(nb.sample() == 0.0 for _ in range(1_000))
+
+
+@pytest.mark.parametrize('kwargs', [
+    dict(mean=2.0, r=3.0, p=0.5),         # both parameterizations at once
+    dict(dispersion=1.0, r=3.0, p=0.5),
+    dict(r=3.0),                          # only half of r/p
+    dict(p=0.5),
+    dict(r=0.0, p=0.5),                   # r out of range
+    dict(r=-1.0, p=0.5),
+    dict(r=3.0, p=0.0),                   # p out of range
+    dict(r=3.0, p=1.5),
+    dict(r=3.0, p=-0.5),
+])
+def test_negbinom_rejects_invalid_r_p(kwargs):
+    """Tests that the two parameterizations cannot be mixed, that r/p has to
+    be given as a pair, and that both are range checked.
+    """
+    with pytest.raises(ValueError):
+        NegBinom(**kwargs)
+
+
 def test_negbinom_pickles_to_the_same_class():
     """Tests that a NegBinom round trips through pickle as a NegBinom, with
     its parameters intact, rather than unpickling to the plain RanVar base.
