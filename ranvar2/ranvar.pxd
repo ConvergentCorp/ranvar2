@@ -61,3 +61,14 @@ cdef class NegBinom(RanVar):
 
     cpdef double sample(self)
     cpdef double quantile(self, double p)
+
+
+# RanVarArray only needs _at() declared here: it is the one method
+# ranvar2.compiler's generated loops call, so it is the one that has to reach
+# RanVar._sample through the vtable rather than through Python attribute
+# lookup. Everything else on RanVarArray is a plain method, used only from
+# ordinary (uncompiled) Python code.
+cdef class RanVarArray:
+    cdef list _items
+
+    cpdef RanVar _at(self, int i)

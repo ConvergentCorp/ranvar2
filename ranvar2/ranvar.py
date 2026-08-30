@@ -1410,3 +1410,431 @@ class NegBinom(RanVar):
             (self.nActive, self.bins, self.cnts),
         )
 
+
+# A collection of digests. -----------------------------------------------------
+
+@cclass
+class RanVarArray():
+    """A mutable, list-like sequence of RanVar instances.
+
+    Some models depend on a whole collection of digests rather than a single
+    one -- one per region, one per product line -- and RanVarArray is what
+    lets a model take that as one parameter instead of *args. It behaves like
+    an ordinary list (indexing, slicing, append, len, +, iteration, ...), and
+    every element has to be a RanVar (Normal and NegBinom included, since both
+    subclass it), checked on insertion.
+
+    Its other job is letting ranvar2.compiler compile a loop over it: `for x
+    in arr:` inside a @cfunc model, where arr is a parameter annotated
+    RanVarArray, is rewritten into an indexed loop calling _at() below, so
+    that fetching each element -- and then drawing from it with ~x or
+    x.sample() -- is a direct C call rather than the generic (Python object
+    producing) iteration protocol. See ranvar2.compiler.ArrayLoops.
+
+    Attributes:
+        _items (list): The wrapped RanVar instances, in order.
+
+    Example:
+        >>> regions = RanVarArray.fromList([Normal(100, 10), Normal(200, 20)])
+        >>> len(regions)
+        2
+        >>> regions.append(Normal(50, 5))
+        >>> [r.mean() for r in regions]
+        [100.0, 200.0, 50.0]
+    """
+
+    _items: list
+
+    def __init__(self, items=None):
+        """Wrap a collection of RanVar instances.
+
+        Args:
+            items (iterable, optional): RanVar instances to start with.
+                                       Defaults to an empty array.
+
+        Raises:
+            TypeError: If any item is not a RanVar instance.
+        """
+        self._items = []
+
+        if items is not None:
+            for item in items:
+                self._items.append(self._check(item))
+
+    @classmethod
+    def fromList(cls, items):
+        """Build a RanVarArray from a plain Python list (or any iterable).
+
+        Args:
+            items (iterable): RanVar instances to wrap.
+
+        Returns:
+            RanVarArray: The new array.
+
+        Raises:
+            TypeError: If any item is not a RanVar instance.
+        """
+        return cls(items)
+
+    def _check(self, item):
+        """Validate that an item may go into the array.
+
+        Args:
+            item (object): The candidate item.
+
+        Returns:
+            RanVar: item, unchanged.
+
+        Raises:
+            TypeError: If item is not a RanVar instance.
+        """
+        if not isinstance(item, RanVar):
+            raise TypeError(
+                f'RanVarArray only holds RanVar instances (Normal, NegBinom, '
+                f'... included, since both subclass it), got '
+                f'{type(item).__name__!r}'
+            )
+
+        return item
+
+    @ccall
+    @boundscheck(False)
+    @wraparound(False)
+    def _at(self, i: cint) -> RanVar:
+        """Fetch an element through a C signature, for a compiled loop to call.
+
+        Args:
+            i (int): Index of the element to fetch.
+
+        Returns:
+            RanVar: The element at that index.
+        """
+        return self._items[i]
+
+    def __len__(self) -> cint:
+        """Number of RanVar instances in the array.
+
+        Typed so a compiled model's `len(arr)` reads the count directly rather
+        than boxing it into a Python int first.
+
+        Returns:
+            int: The element count.
+        """
+        return len(self._items)
+
+    def __getitem__(self, key):
+        """Get an item or a slice.
+
+        Args:
+            key (int | slice): Position, or range of positions, to fetch.
+
+        Returns:
+            RanVar: The element at key, if key is an int.
+            RanVarArray: A new array over the slice, if key is a slice.
+        """
+        if isinstance(key, slice):
+            return RanVarArray(self._items[key])
+
+        return self._items[key]
+
+    def __setitem__(self, key, value):
+        """Set an item or a slice.
+
+        Args:
+            key (int | slice): Position, or range of positions, to replace.
+            value (RanVar | iterable): The replacement, matching key's shape.
+
+        Raises:
+            TypeError: If value (or any of its elements) is not a RanVar.
+        """
+        if isinstance(key, slice):
+            self._items[key] = [self._check(v) for v in value]
+        else:
+            self._items[key] = self._check(value)
+
+    def __delitem__(self, key):
+        """Remove an item or a slice.
+
+        Args:
+            key (int | slice): Position, or range of positions, to remove.
+        """
+        del self._items[key]
+
+    def __iter__(self):
+        """Iterate over the wrapped RanVar instances.
+
+        Returns:
+            iterator: Yields each RanVar in order.
+        """
+        return iter(self._items)
+
+    def __reversed__(self):
+        """Iterate over the wrapped RanVar instances in reverse.
+
+        Returns:
+            iterator: Yields each RanVar in reverse order.
+        """
+        return reversed(self._items)
+
+    def __contains__(self, item):
+        """Report whether an item is in the array.
+
+        Args:
+            item (object): The item to look for.
+
+        Returns:
+            bool: True if item is present.
+        """
+        return item in self._items
+
+    def __bool__(self):
+        """Report whether the array holds any elements.
+
+        Returns:
+            bool: True if the array is non empty.
+        """
+        return bool(self._items)
+
+    def __eq__(self, other):
+        """Compare against another RanVarArray or a plain list.
+
+        Args:
+            other (object): What to compare against.
+
+        Returns:
+            bool: True if other holds the same elements in the same order.
+            NotImplemented: If other is neither a RanVarArray nor a list.
+        """
+        # A cdef attribute reached through a plainly typed parameter is a
+        # Python-level lookup rather than the direct struct access it would be
+        # through self, and cdef attributes aren't visible that way at all, so
+        # `other` is narrowed to its static type first.
+        if isinstance(other, RanVarArray):
+            typed: RanVarArray = other
+
+            return self._items == typed._items
+
+        if isinstance(other, list):
+            return self._items == other
+
+        return NotImplemented
+
+    def index(self, item, start=0, stop=None):
+        """Find the position of an item.
+
+        Args:
+            item (RanVar): The item to look for.
+            start (int, optional): Position to start searching from.
+            stop (int, optional): Position to stop searching before.
+
+        Returns:
+            int: The position of the first matching item.
+
+        Raises:
+            ValueError: If item is not present.
+        """
+        if stop is None:
+            stop = len(self._items)
+
+        return self._items.index(item, start, stop)
+
+    def count(self, item):
+        """Count how many times an item appears.
+
+        Args:
+            item (RanVar): The item to count.
+
+        Returns:
+            int: How many elements equal item.
+        """
+        return self._items.count(item)
+
+    def append(self, item):
+        """Add an item to the end.
+
+        Args:
+            item (RanVar): The item to add.
+
+        Raises:
+            TypeError: If item is not a RanVar instance.
+        """
+        self._items.append(self._check(item))
+
+    def insert(self, index, item):
+        """Insert an item before a position.
+
+        Args:
+            index (int): Position to insert before.
+            item (RanVar): The item to insert.
+
+        Raises:
+            TypeError: If item is not a RanVar instance.
+        """
+        self._items.insert(index, self._check(item))
+
+    def extend(self, items):
+        """Add every item from an iterable to the end.
+
+        Args:
+            items (iterable): RanVar instances to add.
+
+        Raises:
+            TypeError: If any item is not a RanVar instance.
+        """
+        self._items.extend(self._check(item) for item in items)
+
+    def pop(self, index=-1):
+        """Remove and return an item.
+
+        Args:
+            index (int, optional): Position to remove. Defaults to the last.
+
+        Returns:
+            RanVar: The removed item.
+
+        Raises:
+            IndexError: If the array is empty.
+        """
+        return self._items.pop(index)
+
+    def remove(self, item):
+        """Remove the first occurrence of an item.
+
+        Args:
+            item (RanVar): The item to remove.
+
+        Raises:
+            ValueError: If item is not present.
+        """
+        self._items.remove(item)
+
+    def clear(self):
+        """Remove every item."""
+        self._items.clear()
+
+    def copy(self):
+        """Make a shallow copy.
+
+        Returns:
+            RanVarArray: A new array wrapping the same RanVar instances.
+        """
+        return RanVarArray(self._items)
+
+    def reverse(self):
+        """Reverse the array in place."""
+        self._items.reverse()
+
+    def sort(self, key=None, reverse=False):
+        """Sort the array in place.
+
+        RanVar instances have no natural order, so a key function is usually
+        needed, e.g. `arr.sort(key=lambda r: r.mean())`.
+
+        Args:
+            key (callable, optional): Function computing a sort key per item.
+            reverse (bool, optional): Sort descending instead of ascending.
+        """
+        self._items.sort(key=key, reverse=reverse)
+
+    def __add__(self, other):
+        """Concatenate with another array or list.
+
+        Args:
+            other (RanVarArray | list): What to append.
+
+        Returns:
+            RanVarArray: A new array holding both sides' elements.
+            NotImplemented: If other is neither a RanVarArray nor a list.
+        """
+        if isinstance(other, RanVarArray):
+            typed: RanVarArray = other
+
+            return RanVarArray(self._items + typed._items)
+
+        if isinstance(other, list):
+            return RanVarArray(self._items + other)
+
+        return NotImplemented
+
+    def __radd__(self, other):
+        """Concatenate when this array is on the right of +.
+
+        Args:
+            other (list): What this array is being appended to.
+
+        Returns:
+            RanVarArray: A new array holding both sides' elements.
+            NotImplemented: If other is not a list.
+        """
+        if isinstance(other, list):
+            return RanVarArray(other + self._items)
+
+        return NotImplemented
+
+    def __iadd__(self, other):
+        """Extend in place with +=.
+
+        Args:
+            other (iterable): RanVar instances to add.
+
+        Returns:
+            RanVarArray: This array.
+
+        Raises:
+            TypeError: If any item is not a RanVar instance.
+        """
+        self.extend(other)
+
+        return self
+
+    def __mul__(self, n):
+        """Repeat the array's elements n times.
+
+        Args:
+            n (int): Number of repetitions.
+
+        Returns:
+            RanVarArray: A new array with the elements repeated.
+        """
+        return RanVarArray(self._items * n)
+
+    def __rmul__(self, n):
+        """Repeat the array's elements n times (n * arr).
+
+        Args:
+            n (int): Number of repetitions.
+
+        Returns:
+            RanVarArray: A new array with the elements repeated.
+        """
+        return RanVarArray(self._items * n)
+
+    def __imul__(self, n):
+        """Repeat the array's elements n times, in place.
+
+        Args:
+            n (int): Number of repetitions.
+
+        Returns:
+            RanVarArray: This array.
+        """
+        self._items *= n
+
+        return self
+
+    def __repr__(self):
+        """Describe this array, for debugging.
+
+        Returns:
+            str: The wrapped elements, in list form.
+        """
+        return f'RanVarArray({self._items!r})'
+
+    def __reduce__(self):
+        """Support pickling and copying.
+
+        Returns:
+            tuple: The (callable, args) pair pickle expects.
+        """
+        return (RanVarArray, (list(self._items),))
+

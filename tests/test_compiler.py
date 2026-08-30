@@ -353,3 +353,123 @@ def test_rejects_drawing_from_an_attribute():
 
     with pytest.raises(mc.RanVarCompileError):
         model.drawsFromSelf()
+
+
+# RanVarArray. -------------------------------------------------------------
+
+def makeArray():
+    """Build a small RanVarArray of parametric digests to draw from."""
+    return mc.RanVarArray.fromList([
+        mc.Normal(100.0, 5.0),
+        mc.Normal(200.0, 10.0),
+        mc.Normal(50.0, 2.0),
+    ])
+
+
+def total(regions: mc.RanVarArray) -> cython.double:
+    """A model that draws from every element of a RanVarArray with ~."""
+    som: cython.double = 0.0
+
+    for region in regions:
+        som += ~region
+
+    return som
+
+
+def totalBySample(regions: mc.RanVarArray) -> cython.double:
+    """The same model, drawing with .sample() instead of ~."""
+    som: cython.double = 0.0
+
+    for region in regions:
+        som += region.sample()
+
+    return som
+
+
+def test_iterates_a_ranvar_array():
+    """Tests that a compiled model can draw from every element of an array."""
+    result = mc.cfunc(total, samples=50_000)(makeArray())
+
+    assert isinstance(result, mc.RanVar)
+    assert result.mean() == pytest.approx(350.0, abs=2.0)
+
+
+def test_sample_method_works_the_same_as_invert_in_a_loop():
+    """Tests that .sample() and ~ compile to the same thing inside the loop."""
+    mc.seed(2024)
+    viaInvert = mc.cfunc(total, samples=5_000)(makeArray())
+
+    mc.seed(2024)
+    viaSample = mc.cfunc(totalBySample, samples=5_000)(makeArray())
+
+    assert viaInvert.mean() == viaSample.mean()
+
+
+def test_array_loop_matches_the_interpreted_executor():
+    """Tests that compiling a RanVarArray loop does not change the result."""
+    arr = makeArray()
+
+    mc.seed(13)
+    fast = mc.cfunc(total, samples=5_000)(arr)
+
+    mc.seed(13)
+    plain = mc.func(total, samples=5_000)(arr)
+
+    assert fast.mean() == plain.mean()
+
+
+def test_array_loop_compiles_to_an_indexed_c_loop():
+    """Tests that `for x in arr:` is rewritten away from generic iteration.
+
+    The rewritten source should index through arr._at() rather than iterating
+    arr directly, since that is what lets the fetch -- and the sample() call
+    that follows -- compile to a direct C call instead of the generic (Python
+    object producing) iteration protocol.
+    """
+    model = mc.cfunc(total).compile().model
+
+    assert 'for region in regions' not in model.source
+    assert 'regions._at(' in model.source
+    assert 'region: RanVar' in model.source
+    assert 'region.sample()' in model.source
+
+
+def test_rejects_drawing_from_a_ranvar_array_directly():
+    """Tests that ~arr is refused: an array has no single value to draw."""
+
+    def drawsArrayDirectly(regions: mc.RanVarArray) -> cython.double:
+        return ~regions
+
+    with pytest.raises(mc.RanVarCompileError):
+        mc.cfunc(drawsArrayDirectly).compile()
+
+
+def test_rejects_unpacking_an_array_loop():
+    """Tests that a RanVarArray can only be iterated one element at a time."""
+
+    def unpacksTwo(regions: mc.RanVarArray) -> cython.double:
+        som: cython.double = 0.0
+
+        for a, b in regions:
+            som += 1.0
+
+        return som
+
+    with pytest.raises(mc.RanVarCompileError):
+        mc.cfunc(unpacksTwo).compile()
+
+
+def test_rejects_a_ranvar_array_read_from_the_module():
+    """Tests that drawing from an array that is not a parameter is refused."""
+    moduleArray = makeArray()
+
+    def readsGlobalArray() -> cython.double:
+        som: cython.double = 0.0
+
+        for r in moduleArray:
+            som += ~r
+
+        return som
+
+    with pytest.raises(mc.RanVarCompileError):
+        mc.cfunc(readsGlobalArray).compile()

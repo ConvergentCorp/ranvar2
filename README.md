@@ -162,6 +162,48 @@ of standard C `math.h` functions (`Normal.quantile()`,
 `NegBinom.cdf()`/`ccdf()`/`dcdf()`/`dccdf()`/`quantile()`) raise
 `NotImplementedError` rather than silently reading an unrelated digest.
 
+### `RanVarArray`: a collection of digests
+
+Some models depend on a whole collection of `RanVar`s rather than a single
+one — one per region, one per product line. `RanVarArray` wraps a list of
+them behind the ordinary list interface (indexing, slicing, `append`,
+`len`, `+`, iteration, ...), while still letting `@cfunc` compile a loop
+over it:
+
+```python
+from ranvar2 import Normal, RanVarArray, cfunc
+
+regions = RanVarArray.fromList([
+    Normal(mean=100.0, std=10.0),
+    Normal(mean=200.0, std=15.0),
+    Normal(mean=50.0, std=5.0),
+])
+
+@cfunc(samples=200_000)
+def totalDemand(regions: RanVarArray) -> cython.double:
+    total: cython.double = 0.0
+    for region in regions:
+        total += ~region
+    return total
+
+totalDemand(regions).mean()   # ~350.0
+```
+
+`for region in regions:` over a parameter annotated `RanVarArray` is
+rewritten by the compiler into an indexed loop that fetches each element
+through a C call, so drawing from every region — with `~region` or
+`region.sample()` — costs one C call per element, the same as a single
+`RanVar` parameter does. Only that pattern (a bare `RanVarArray` parameter,
+one loop variable) gets rewritten; slicing or indexing the array first still
+works, just as ordinary Python.
+
+Every element has to be a `RanVar` (`Normal` and `NegBinom` included, since
+both subclass it) — checked on `fromList()`, the plain constructor, and
+every mutation. `~regions` (drawing from the array itself, rather than an
+element) and reading a `RanVarArray` from the surrounding module (rather
+than taking it as a parameter) are both refused for the same reason a bare
+`RanVar` would be.
+
 ### Reproducibility
 
 Sampling draws from a single process-global C generator (`rand()`/`srand()`
