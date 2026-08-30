@@ -1498,16 +1498,25 @@ class RanVarArray():
         return item
 
     @ccall
-    @boundscheck(False)
-    @wraparound(False)
     def _at(self, i: cint) -> RanVar:
-        """Fetch an element through a C signature, for a compiled loop to call.
+        """Fetch an element through a C signature, for compiled code to call.
+
+        Reached both from the compiler's own loop counters (always in range)
+        and from a user's own index expression rewritten from arr[i] (not
+        guaranteed to be), so bounds checking and negative-index wraparound
+        stay on here, unlike the internal methods elsewhere in this module
+        that only ever see indices their own algorithm already guarantees are
+        in range.
 
         Args:
-            i (int): Index of the element to fetch.
+            i (int): Index of the element to fetch. May be negative, Python
+                   style, to count from the end.
 
         Returns:
             RanVar: The element at that index.
+
+        Raises:
+            IndexError: If i is out of range.
         """
         return self._items[i]
 

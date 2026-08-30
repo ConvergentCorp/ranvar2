@@ -473,3 +473,108 @@ def test_rejects_a_ranvar_array_read_from_the_module():
 
     with pytest.raises(mc.RanVarCompileError):
         mc.cfunc(readsGlobalArray).compile()
+
+
+def totalByIndex(arr: mc.RanVarArray) -> cython.double:
+    """A model that draws from a fixed number of indexed elements with ~."""
+    som: cython.double = 0.0
+
+    for i in range(3):
+        som += ~arr[i]
+
+    return som
+
+
+def totalByIndexSample(arr: mc.RanVarArray) -> cython.double:
+    """The same model, drawing with .sample() instead of ~."""
+    som: cython.double = 0.0
+
+    for i in range(3):
+        som += arr[i].sample()
+
+    return som
+
+
+def test_indexes_a_ranvar_array():
+    """Tests that a compiled model can draw from indexed elements of an array."""
+    result = mc.cfunc(totalByIndex, samples=50_000)(makeArray())
+
+    assert isinstance(result, mc.RanVar)
+    assert result.mean() == pytest.approx(350.0, abs=2.0)
+
+
+def test_index_access_compiles_to_a_direct_at_call():
+    """Tests that arr[i] is rewritten away from the generic __getitem__.
+
+    The rewritten source should call arr._at() directly rather than
+    subscripting arr, since that is what lets the fetch -- and the sample()
+    call that follows -- compile to a C call instead of the generic (Python
+    object producing, and here also boxed-index) subscript protocol.
+    """
+    model = mc.cfunc(totalByIndex).compile().model
+
+    assert 'arr[i]' not in model.source
+    assert 'arr._at(i)' in model.source
+    assert 'arr._at(i).sample()' in model.source
+
+
+def test_index_access_matches_the_interpreted_executor():
+    """Tests that compiling an indexed draw does not change the result."""
+    arr = makeArray()
+
+    mc.seed(21)
+    fast = mc.cfunc(totalByIndex, samples=5_000)(arr)
+
+    mc.seed(21)
+    plain = mc.func(totalByIndex, samples=5_000)(arr)
+
+    assert fast.mean() == plain.mean()
+
+
+def test_index_access_invert_matches_sample_method():
+    """Tests that ~arr[i] and arr[i].sample() compile to the same thing."""
+    arr = makeArray()
+
+    mc.seed(99)
+    viaInvert = mc.cfunc(totalByIndex, samples=5_000)(arr)
+
+    mc.seed(99)
+    viaSample = mc.cfunc(totalByIndexSample, samples=5_000)(arr)
+
+    assert viaInvert.mean() == viaSample.mean()
+
+
+def test_index_access_supports_negative_indices():
+    """Tests that arr[-1] counts from the end, like a plain list."""
+
+    def last(arr: mc.RanVarArray) -> cython.double:
+        return ~arr[-1]
+
+    result = mc.cfunc(last, samples=20_000)(makeArray())
+
+    assert result.mean() == pytest.approx(50.0, abs=2.0)
+
+
+def test_index_access_raises_for_an_out_of_range_index():
+    """Tests that an out of range index raises rather than reading garbage.
+
+    arr._at() keeps bounds checking on, unlike the internal methods elsewhere
+    in ranvar.py, because it is reached from a user's own index expression
+    rather than only from a loop counter the compiler generates itself.
+    """
+
+    def outOfRange(arr: mc.RanVarArray) -> cython.double:
+        return ~arr[99]
+
+    with pytest.raises(IndexError):
+        mc.cfunc(outOfRange, samples=10)(makeArray())
+
+
+def test_rejects_drawing_from_a_ranvar_array_slice():
+    """Tests that ~arr[1:3] is refused: a slice is still several digests."""
+
+    def slicedInvert(arr: mc.RanVarArray) -> cython.double:
+        return ~arr[1:3]
+
+    with pytest.raises(mc.RanVarCompileError):
+        mc.cfunc(slicedInvert).compile()

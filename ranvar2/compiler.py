@@ -94,7 +94,7 @@ class Model():
         loops = ArrayLoops(self.arrays, self.fail)
         node  = loops.visit(node)
 
-        node = Draws(self.digests + loops.bound).visit(node)
+        node = Draws(self.digests + loops.bound, self.arrays).visit(node)
 
         ast.fix_missing_locations(node)
 
@@ -298,11 +298,26 @@ class Model():
             if not isinstance(child, ast.UnaryOp) or not isinstance(child.op, ast.Invert):
                 continue
 
-            if isinstance(child.operand, ast.Name) and child.operand.id in self.arrays:
+            operand = child.operand
+
+            if isinstance(operand, ast.Name) and operand.id in self.arrays:
                 self.fail(
-                    f'~{child.operand.id} draws from a RanVarArray directly. It '
+                    f'~{operand.id} draws from a RanVarArray directly. It '
                     f'holds several digests, not one: iterate over it instead, '
-                    f'e.g. `for x in {child.operand.id}: ... ~x`'
+                    f'e.g. `for x in {operand.id}: ... ~x`'
+                )
+
+            if (
+                isinstance(operand, ast.Subscript)
+                and isinstance(operand.value, ast.Name)
+                and operand.value.id in self.arrays
+                and isinstance(operand.slice, ast.Slice)
+            ):
+                self.fail(
+                    f'~{ast.unparse(operand)} draws from a slice of a '
+                    f'RanVarArray, which is still several digests rather than '
+                    f'one. Index a single element instead, e.g. '
+                    f'~{operand.value.id}[0]'
                 )
 
     def lookup(self, name):
@@ -443,24 +458,63 @@ def {prefix}runMany({prefix}outs: list, {prefix}samples: cython.int{comma}{decla
 
 
 class Draws(ast.NodeTransformer):
-    """Rewrites a draw from a digest parameter into a call to sample().
+    """Rewrites a draw from a digest into a call to sample().
 
     ~a and a.sample() mean the same thing, but the invert slot has to return a
     Python object, so only the second compiles to a C call. Only parameters
-    annotated as RanVars are rewritten, which leaves ~ on an integer meaning
-    what it always meant.
+    annotated as RanVars (directly, or as an element of a RanVarArray reached
+    by indexing) are rewritten, which leaves ~ on an integer meaning what it
+    always meant.
+
+    arr[i], arr a RanVarArray parameter, is also rewritten on its own -- into
+    arr._at(i) -- independently of whether it sits under a ~, since arr._at()
+    is a proper index into the array (bounds checked, negative indices
+    wraparound like a list's) rather than the generic __getitem__ a plain
+    subscript on arr would otherwise call.
     """
 
-    def __init__(self, digests):
+    def __init__(self, digests, arrays):
         """Prepare to rewrite draws.
 
         Args:
-            digests (list): Names of the parameters annotated as RanVars.
+            digests (list): Names of the parameters annotated as RanVars, or
+                          bound as a RanVarArray loop's element.
+            arrays (list): Names of the parameters annotated RanVarArray.
         """
         self.digests = set(digests)
+        self.arrays  = set(arrays)
+
+    def visit_Subscript(self, node):
+        """Rewrite arr[i] into arr._at(i), for arr a RanVarArray parameter.
+
+        Args:
+            node (ast.Subscript): The subscript expression.
+
+        Returns:
+            ast.AST: The rewritten node, or the original.
+        """
+        self.generic_visit(node)
+
+        if not isinstance(node.ctx, ast.Load):
+            return node
+
+        if not isinstance(node.value, ast.Name) or node.value.id not in self.arrays:
+            return node
+
+        # A slice (arr[1:3]) still needs RanVarArray's own __getitem__, since
+        # _at() only fetches one element; left alone, so ~arr[1:3] fails the
+        # same way ~arr does rather than being rewritten into nonsense.
+        if isinstance(node.slice, ast.Slice):
+            return node
+
+        return ast.Call(
+            func=ast.Attribute(value=node.value, attr='_at', ctx=ast.Load()),
+            args=[node.slice],
+            keywords=[],
+        )
 
     def visit_UnaryOp(self, node):
-        """Rewrite ~digest into digest.sample().
+        """Rewrite ~digest (or ~arr[i]) into a call to sample().
 
         Args:
             node (ast.UnaryOp): The expression node.
@@ -473,11 +527,24 @@ class Draws(ast.NodeTransformer):
         if not isinstance(node.op, ast.Invert):
             return node
 
-        if not isinstance(node.operand, ast.Name) or node.operand.id not in self.digests:
+        operand = node.operand
+
+        # generic_visit() above has already run visit_Subscript() on operand,
+        # so arr[i] is by this point arr._at(i) rather than a Subscript node.
+        isDigest = isinstance(operand, ast.Name) and operand.id in self.digests
+        isElement = (
+            isinstance(operand, ast.Call)
+            and isinstance(operand.func, ast.Attribute)
+            and operand.func.attr == '_at'
+            and isinstance(operand.func.value, ast.Name)
+            and operand.func.value.id in self.arrays
+        )
+
+        if not (isDigest or isElement):
             return node
 
         return ast.Call(
-            func=ast.Attribute(value=node.operand, attr='sample', ctx=ast.Load()),
+            func=ast.Attribute(value=operand, attr='sample', ctx=ast.Load()),
             args=[],
             keywords=[],
         )
@@ -497,8 +564,11 @@ class ArrayLoops(ast.NodeTransformer):
     x.sample(), the same as it does for a RanVar parameter.
 
     Only `for x in arr:`, arr a bare parameter reference and x a single name,
-    is rewritten. Anything else (unpacking, slicing, indexing arr first) is
-    left as ordinary Python, which still runs, just without the same speed.
+    is rewritten here; a fixed number of elements reached by indexing (`for i
+    in range(5): ~arr[i]`) gets its own fast path in Draws instead, since
+    there is no single loop variable there for this pass to name. Unpacking or
+    slicing before iterating is left as ordinary Python, which still runs,
+    just without the same speed.
 
     Attributes:
         arrays (set): Names of the parameters annotated RanVarArray.

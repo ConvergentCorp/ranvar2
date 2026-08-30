@@ -193,16 +193,32 @@ totalDemand(regions).mean()   # ~350.0
 rewritten by the compiler into an indexed loop that fetches each element
 through a C call, so drawing from every region — with `~region` or
 `region.sample()` — costs one C call per element, the same as a single
-`RanVar` parameter does. Only that pattern (a bare `RanVarArray` parameter,
-one loop variable) gets rewritten; slicing or indexing the array first still
-works, just as ordinary Python.
+`RanVar` parameter does.
+
+A fixed number of elements reached by indexing compiles the same way:
+
+```python
+@cfunc(samples=200_000)
+def firstTwo(regions: RanVarArray) -> cython.double:
+    total: cython.double = 0.0
+    for i in range(2):
+        total += ~regions[i]
+    return total
+```
+
+`regions[i]`, `i` an index expression rather than a slice, is rewritten into
+a direct (bounds checked, negative-index aware, like a plain list's) fetch,
+so `~regions[i]` and `regions[i].sample()` are both a C call per element too.
+Only these two patterns — a bare `RanVarArray` parameter iterated directly,
+or indexed with a single expression — are rewritten; unpacking, or slicing
+the array first, still works, just as ordinary Python.
 
 Every element has to be a `RanVar` (`Normal` and `NegBinom` included, since
 both subclass it) — checked on `fromList()`, the plain constructor, and
-every mutation. `~regions` (drawing from the array itself, rather than an
-element) and reading a `RanVarArray` from the surrounding module (rather
-than taking it as a parameter) are both refused for the same reason a bare
-`RanVar` would be.
+every mutation. `~regions` and `~regions[1:3]` (drawing from the whole array
+or a slice of it, rather than a single element) and reading a `RanVarArray`
+from the surrounding module (rather than taking it as a parameter) are all
+refused for the same reason a bare `RanVar` would be.
 
 ### Reproducibility
 
