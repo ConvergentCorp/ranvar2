@@ -40,3 +40,9 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 packages = ["ranvar2"]
+
+# cfunc compiles each model at runtime against ranvar2.ranvar, which means the
+# .pxd has to travel with the installed package: without it a model compiled in
+# a downstream project fails with "'ranvar2/ranvar.pxd' not found".
+[tool.setuptools.package-data]
+ranvar2 = ["*.pxd"]
