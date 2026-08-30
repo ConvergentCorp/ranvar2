@@ -17,7 +17,10 @@ from cython.cimports.libc.math import floor as cfloor
 from cython.cimports.libc.math import fabs as cfabs
 from cython.cimports.libc.math import lgamma as clgamma
 from cython.cimports.libc.math import pow as cpow
+from cython.cimports.libc.math import erf as cerf
+from cython.cimports.libc.math import erfc as cerfc
 from cython.cimports.libc.math import M_PI
+from cython.cimports.libc.math import M_SQRT2
 
 
 def seed(value):
@@ -981,6 +984,104 @@ class Normal(RanVar):
         """
         return self._std
 
+    def lower(self):
+        """Return this distribution's lower support bound.
+
+        Unlike RanVar.lower(), which reads the smallest fitted centroid, this
+        is the bound of Normal's own support and does not depend on whether
+        anything has been added with add()/fit().
+
+        Returns:
+            float: -inf, since a normal distribution has unbounded support.
+        """
+        return float('-inf')
+
+    def upper(self):
+        """Return this distribution's upper support bound.
+
+        Returns:
+            float: +inf, since a normal distribution has unbounded support.
+        """
+        return float('inf')
+
+    def cdf(self, k):
+        """Compute the CDF of Normal(mean, std) at a point.
+
+        Uses erf() from math.h directly, since the normal CDF has a closed
+        form, rather than RanVar.cdf()'s piecewise-linear read of a fitted
+        digest.
+
+        Args:
+            k (float): The point to evaluate the CDF at.
+
+        Returns:
+            float: The probability of drawing at most k.
+        """
+        z = (k - self._mean) / (self._std * M_SQRT2)
+
+        return 0.5 * (1.0 + cerf(z))
+
+    def ccdf(self, x):
+        """Compute the complementary CDF of Normal(mean, std) at a point.
+
+        Uses erfc() directly rather than 1 - cdf(x), which loses precision
+        far into the tail where cdf(x) is close to 1.
+
+        Args:
+            x (float): The point to evaluate the CCDF at.
+
+        Returns:
+            float: The probability of drawing more than x.
+        """
+        z = (x - self._mean) / (self._std * M_SQRT2)
+
+        return 0.5 * cerfc(z)
+
+    def dcdf(self, k):
+        """Compute the density of Normal(mean, std) at a point.
+
+        The normal density has a closed form, so this is exact rather than
+        RanVar.dcdf()'s gradient of the piecewise-linear digest CDF.
+
+        Args:
+            k (float): The point to evaluate the density at.
+
+        Returns:
+            float: The density at k.
+        """
+        z = (k - self._mean) / self._std
+
+        return cexp(-0.5 * z * z) / (self._std * csqrt(2.0 * M_PI))
+
+    def dccdf(self, k):
+        """Compute the derivative of the complementary CDF at a point.
+
+        Args:
+            k (float): The point to evaluate the derivative at.
+
+        Returns:
+            float: The negated density at k.
+        """
+        return -self.dcdf(k)
+
+    @ccall
+    def quantile(self, p: cdouble) -> cdouble:
+        """Not implemented: the normal quantile function has no closed form.
+
+        Its inverse needs the inverse error function, erfinv, which is not
+        among the C99 math.h functions this library restricts itself to, so
+        there is no analytical expression to evaluate here the way sample()
+        and cdf() have.
+
+        Raises:
+            NotImplementedError: Always.
+        """
+        raise NotImplementedError(
+            'Normal.quantile() has no closed form using only standard C '
+            'math functions: it would need erfinv, which math.h does not '
+            'provide.'
+        )
+
     def __reduce__(self):
         """Support pickling and copying.
 
@@ -1080,6 +1181,102 @@ class NegBinom(RanVar):
             float: How much the variance exceeds a same-mean Poisson's.
         """
         return self._dispersion
+
+    def lower(self):
+        """Return this distribution's lower support bound.
+
+        Unlike RanVar.lower(), which reads the smallest fitted centroid, this
+        is the bound of NegBinom's own support (a count, so it starts at 0)
+        and does not depend on whether anything has been added with
+        add()/fit().
+
+        Returns:
+            float: 0.0, the smallest count NegBinom can draw.
+        """
+        return 0.0
+
+    def upper(self):
+        """Return this distribution's upper support bound.
+
+        Returns:
+            float: +inf, since a count has no fixed largest value.
+        """
+        return float('inf')
+
+    def cdf(self, k):
+        """Not implemented: no closed form using only standard C math
+        functions.
+
+        The negative binomial CDF is a regularized incomplete beta function,
+        which is not among the functions in math.h this library restricts
+        itself to, and summing the PMF up to k would be an unbounded loop
+        rather than an analytical expression.
+
+        Raises:
+            NotImplementedError: Always.
+        """
+        raise NotImplementedError(
+            'NegBinom.cdf() has no closed form using only standard C math '
+            'functions: it would need the regularized incomplete beta '
+            'function, which math.h does not provide.'
+        )
+
+    def ccdf(self, x):
+        """Not implemented, for the same reason as cdf().
+
+        Raises:
+            NotImplementedError: Always.
+        """
+        raise NotImplementedError(
+            'NegBinom.ccdf() has no closed form using only standard C math '
+            'functions, for the same reason as NegBinom.cdf().'
+        )
+
+    def dcdf(self, k):
+        """Not implemented: NegBinom is discrete, so it has no density.
+
+        RanVar.dcdf() estimates a density from the piecewise-linear digest
+        CDF, which is a meaningful thing to do for the continuous
+        distribution a fitted digest approximates. NegBinom's CDF is a step
+        function instead, whose derivative is zero almost everywhere and
+        undefined at the steps, so there is nothing analogous to return.
+
+        Raises:
+            NotImplementedError: Always.
+        """
+        raise NotImplementedError(
+            'NegBinom.dcdf() is not defined: NegBinom is a discrete '
+            'distribution, so its CDF has no derivative.'
+        )
+
+    def dccdf(self, k):
+        """Not implemented, for the same reason as dcdf().
+
+        Raises:
+            NotImplementedError: Always.
+        """
+        raise NotImplementedError(
+            'NegBinom.dccdf() is not defined, for the same reason as '
+            'NegBinom.dcdf().'
+        )
+
+    @ccall
+    def quantile(self, p: cdouble) -> cdouble:
+        """Not implemented: no closed form using only standard C math
+        functions.
+
+        The negative binomial quantile function is the inverse of the
+        regularized incomplete beta function, which math.h does not provide,
+        so there is no analytical expression to evaluate here the way
+        sample() has.
+
+        Raises:
+            NotImplementedError: Always.
+        """
+        raise NotImplementedError(
+            'NegBinom.quantile() has no closed form using only standard C '
+            'math functions, for the same reason as NegBinom.cdf().'
+        )
 
     def __reduce__(self):
         """Support pickling and copying.

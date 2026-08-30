@@ -1,4 +1,5 @@
 import cython
+import math
 import pickle
 
 import numpy as np
@@ -91,6 +92,47 @@ def test_normal_compiles_through_a_ranvar_annotated_model():
     assert var  == pytest.approx(25.0, abs=1.0)
 
 
+def test_normal_lower_upper_are_unbounded():
+    """Tests that lower()/upper() give the analytical support bounds.
+
+    Unlike RanVar.lower()/upper(), these do not require any data to have
+    been added first.
+    """
+    n = Normal(mean=0.0, std=1.0)
+
+    assert n.lower() == float('-inf')
+    assert n.upper() == float('inf')
+
+
+def test_normal_cdf_matches_the_error_function():
+    """Tests cdf()/ccdf()/dcdf()/dccdf() against a reference built from
+    math.erf(), independently of ranvar2's own erf() cimport.
+    """
+    n = Normal(mean=10.0, std=2.0)
+
+    def phi(x):
+        return 0.5 * (1 + math.erf((x - 10.0) / (2.0 * math.sqrt(2))))
+
+    def density(x):
+        return math.exp(-0.5 * ((x - 10.0) / 2.0) ** 2) / (2.0 * math.sqrt(2 * math.pi))
+
+    for x in (4.0, 8.0, 10.0, 13.5, 17.0):
+        assert n.cdf(x)   == pytest.approx(phi(x))
+        assert n.ccdf(x)  == pytest.approx(1 - phi(x))
+        assert n.dcdf(x)  == pytest.approx(density(x))
+        assert n.dccdf(x) == pytest.approx(-density(x))
+
+    assert n.cdf(10.0) == pytest.approx(0.5)
+
+
+def test_normal_quantile_is_not_implemented():
+    """Tests that quantile() refuses rather than silently reading the
+    (empty, or unrelated to mean/std) fitted digest RanVar.quantile() would.
+    """
+    with pytest.raises(NotImplementedError):
+        Normal(mean=0.0, std=1.0).quantile(0.5)
+
+
 # NegBinom. ------------------------------------------------------------------
 
 def test_negbinom_is_a_ranvar():
@@ -180,3 +222,75 @@ def test_negbinom_compiles_through_a_ranvar_annotated_model():
 
     assert mean == pytest.approx(20.0, rel=0.05, abs=0.1)
     assert var  == pytest.approx(expected, rel=0.1)
+
+
+def test_negbinom_lower_upper_are_analytical():
+    """Tests that lower()/upper() give the analytical support bounds.
+
+    Unlike RanVar.lower()/upper(), these do not require any data to have
+    been added first.
+    """
+    nb = NegBinom(mean=1.0, dispersion=1.0)
+
+    assert nb.lower() == 0.0
+    assert nb.upper() == float('inf')
+
+
+@pytest.mark.parametrize('method, arg', [
+    ('cdf', 3.0),
+    ('ccdf', 3.0),
+    ('dcdf', 3.0),
+    ('dccdf', 3.0),
+    ('quantile', 0.5),
+])
+def test_negbinom_has_no_closed_form_for(method, arg):
+    """Tests that the methods with no NB2 closed form refuse rather than
+    silently reading the (empty, or unrelated to mean/dispersion) fitted
+    digest the inherited RanVar implementation would.
+    """
+    nb = NegBinom(mean=5.0, dispersion=1.0)
+
+    with pytest.raises(NotImplementedError):
+        getattr(nb, method)(arg)
+
+
+# Every public RanVar method is present, whether inherited unchanged (the
+# digest-building and digest-reading ones), overridden analytically, or
+# overridden to refuse. --------------------------------------------------------
+
+PUBLIC_METHODS = [
+    'add', 'getActiveBinCount', 'getBins', 'getWeights', 'lower', 'upper',
+    'cdf', 'ccdf', 'dcdf', 'dccdf', 'quantile', 'sample', 'mean', 'fit',
+]
+
+
+@pytest.mark.parametrize('cls, kwargs', [
+    (Normal, dict(mean=0.0, std=1.0)),
+    (NegBinom, dict(mean=1.0, dispersion=1.0)),
+])
+def test_all_public_ranvar_methods_are_present(cls, kwargs):
+    """Tests that neither subclass is missing a method RanVar exposes."""
+    instance = cls(**kwargs)
+
+    for name in PUBLIC_METHODS:
+        assert hasattr(instance, name), f'{cls.__name__} is missing {name}()'
+
+
+def test_add_and_fit_still_build_an_empirical_digest():
+    """Tests that add()/fit() keep working on the parametric subclasses.
+
+    They are generic t-digest operations, unrelated to sample()'s analytical
+    draw, so nothing about overriding sample()/mean()/etc. should disable
+    them.
+    """
+    n = Normal(mean=0.0, std=1.0)
+    n.fit([1.0, 2.0, 3.0])
+
+    assert n.getActiveBinCount() == 3
+    np.testing.assert_array_equal(n.getBins(), [1.0, 2.0, 3.0])
+    np.testing.assert_array_equal(n.getWeights(), [1.0, 1.0, 1.0])
+
+    nb = NegBinom(mean=1.0, dispersion=1.0)
+    nb.add(4.0)
+
+    assert nb.getActiveBinCount() == 1

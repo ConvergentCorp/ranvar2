@@ -46,6 +46,7 @@ cdef class Normal(RanVar):
     cdef double _std
 
     cpdef double sample(self)
+    cpdef double quantile(self, double p)
 
 
 # NegBinom is parameterized by mean and dispersion (the NB2 form), and caches
@@ -59,3 +60,4 @@ cdef class NegBinom(RanVar):
     cdef double _scale
 
     cpdef double sample(self)
+    cpdef double quantile(self, double p)
