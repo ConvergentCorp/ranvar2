@@ -1,16 +1,37 @@
 [project]
 name = "ranvar2"
 version = "0.1.0"
-description = "Add your description here"
+description = "Fast probabilistic modelling: t-digest random variables and Monte Carlo models compiled with Cython"
 readme = "README.md"
 requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Adolph Vogel", email = "ajvogel@gmail.com" }]
+keywords = ["monte-carlo", "probability", "statistics", "t-digest", "cython", "simulation"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Mathematics",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Cython",
+]
 dependencies = [
     "cython>=3.3.0",
     "numpy>=2.5.2",
-    "pytest>=9.1.1",
     # cfunc compiles generated modules at runtime, which needs a build toolchain
     # present rather than only during the project's own build.
     "setuptools>=77",
+]
+
+[project.urls]
+Homepage = "https://github.com/ajvogel/ranvar2"
+Repository = "https://github.com/ajvogel/ranvar2"
+Issues = "https://github.com/ajvogel/ranvar2/issues"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
 ]
 
 [build-system]

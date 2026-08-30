@@ -1,0 +1,184 @@
+# ranvar2
+
+Fast probabilistic modelling for Python: build random variables as
+[t-digests](https://arxiv.org/abs/1902.04023), combine them with ordinary
+Python functions, and run the resulting Monte Carlo simulations either
+interpreted or compiled to C via [Cython](https://cython.org/).
+
+```python
+import cython
+from ranvar2 import RanVar, cfunc
+
+revenue = RanVar(maxBins=64)
+revenue.fit([95, 100, 105, 98, 102, 110, 90, 100, 101, 99])
+
+cost = RanVar(maxBins=64)
+cost.fit([40, 42, 38, 41, 39, 43, 37])
+
+@cfunc(samples=200_000)
+def profit(revenue: RanVar, cost: RanVar) -> cython.double:
+    margin: cython.double = ~revenue - ~cost
+    return margin
+
+result = profit(revenue, cost)
+print(result.mean(), result.quantile(0.05), result.quantile(0.95))
+```
+
+## Why
+
+A `RanVar` is a random variable represented as a t-digest: a compact,
+bounded-memory summary of a distribution that supports fast quantile lookup
+and sampling. `~x` draws a sample from `x`. Ordinary Python functions that
+draw from one or more `RanVar`s become Monte Carlo models via a decorator:
+
+- `@func` runs the model in the interpreter, samples-per-call at a time.
+- `@cfunc` compiles the model's own source with Cython (in [pure Python
+  mode](https://cython.readthedocs.io/en/latest/src/tutorial/pure.html)) and
+  runs the sampling loop natively in C, with no per-sample trip back into the
+  interpreter. The first call compiles and caches the result; later calls
+  (in this process or a later one) reuse it.
+
+`Normal` and `NegBinom` are `RanVar` subclasses that draw directly from a
+fixed distribution's own formula instead of a fitted digest, so they can be
+used as model inputs — a prior, an assumption, anything you don't have data
+for yet — while still running at C speed inside a `@cfunc` model.
+
+## Requirements
+
+- Python >= 3.12
+- A C compiler toolchain (e.g. `build-essential` on Debian/Ubuntu, Xcode
+  Command Line Tools on macOS). This is needed both to build the package
+  itself and, at runtime, for `@cfunc`, which compiles each model the first
+  time it's called and caches the result under `~/.cache/ranvar2`.
+
+## Installation
+
+Not published to PyPI yet — install directly from GitHub. With
+[uv](https://docs.astral.sh/uv/):
+
+```sh
+uv add git+https://github.com/ajvogel/ranvar2.git
+```
+
+Or with pip:
+
+```sh
+pip install git+https://github.com/ajvogel/ranvar2.git
+```
+
+To pin a specific commit or tag, append `@<ref>` to the URL.
+
+## Quickstart
+
+### Building a `RanVar` from data
+
+```python
+from ranvar2 import RanVar
+
+x = RanVar(maxBins=64)
+x.fit([95, 100, 105, 98, 102, 110, 90, 100, 101, 99])
+
+x.mean()          # the exact weighted mean of what was added
+x.quantile(0.5)   # the median, interpolated from the digest
+x.sample()        # ~x: one draw from the fitted distribution
+x.cdf(100)        # P(X <= 100)
+```
+
+### `@func`: an interpreted Monte Carlo model
+
+```python
+from ranvar2 import RanVar, func
+
+d6 = RanVar(maxBins=8)
+d6.fit([1, 2, 3, 4, 5, 6] * 100)
+
+@func(samples=50_000)
+def rollTwoDice():
+    return ~d6 + ~d6
+
+total = rollTwoDice()   # a RanVar over 50,000 simulated rolls
+total.mean()             # ~7.0
+```
+
+### `@cfunc`: the same idea, compiled
+
+The model's parameters and return type are annotated so Cython can type the
+generated driver; `~x` on an annotated `RanVar` parameter compiles to a
+direct C call (`x.sample()`) rather than a Python-level draw.
+
+```python
+import cython
+from ranvar2 import RanVar, cfunc
+
+@cfunc(samples=200_000)
+def profit(revenue: RanVar, cost: RanVar) -> cython.double:
+    margin: cython.double = ~revenue - ~cost
+    return margin
+
+result = profit(revenue, cost)   # revenue, cost from above
+```
+
+A model returning a tuple (or not annotated with a scalar C return type)
+gets back a `RanVar` per position instead of one:
+
+```python
+@cfunc(samples=100_000)
+def bothDice() -> None:
+    return ~d6, ~d6
+
+first, second = bothDice()
+```
+
+### `Normal` and `NegBinom`: parametric inputs
+
+Use these where you have an assumption or a prior rather than data to fit a
+digest to. Both subclass `RanVar`, so they work anywhere a `RanVar` does,
+including as a `@cfunc` model parameter — sampling still costs one C call.
+
+```python
+from ranvar2 import Normal, NegBinom, RanVar, cfunc
+
+demand  = Normal(mean=500.0, std=50.0)
+defects = NegBinom(mean=3.0, dispersion=0.8)  # variance = mean + dispersion * mean**2
+
+@cfunc(samples=200_000)
+def shortfall(capacity: cython.double, demand: RanVar) -> cython.double:
+    d: cython.double = ~demand
+    return d - capacity if d > capacity else 0.0
+
+shortfall(450.0, demand).mean()
+```
+
+`fit(x)` re-estimates a `Normal`/`NegBinom`'s parameters from data by the
+method of moments (needs at least 2 points); `add()` is refused, since a
+single point can't estimate a spread. Methods with no closed form in terms
+of standard C `math.h` functions (`Normal.quantile()`,
+`NegBinom.cdf()`/`ccdf()`/`dcdf()`/`dccdf()`/`quantile()`) raise
+`NotImplementedError` rather than silently reading an unrelated digest.
+
+### Reproducibility
+
+Sampling draws from a single process-global C generator (`rand()`/`srand()`
+under the hood), shared by every `RanVar`, `Normal`, and `NegBinom`:
+
+```python
+from ranvar2 import seed
+
+seed(1234)   # make every following draw in this process reproducible
+```
+
+## Development
+
+```sh
+git clone https://github.com/ajvogel/ranvar2.git
+cd ranvar2
+uv sync
+uv run pytest
+```
+
+`setup.py` compiles `ranvar2/ranvar.py` with Cython; `uv sync` (or
+`pip install -e .`) rebuilds it as needed.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
