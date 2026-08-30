@@ -1,6 +1,6 @@
 import functools
 
-from ranvar.ranvar import RanVar
+from ranvar2.ranvar import RanVar
 
 # Enough draws for a stable distribution without making an interactive call feel
 # slow. Override per model with @func(samples=...) or per call with withSamples().

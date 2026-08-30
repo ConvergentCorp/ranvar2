@@ -36,23 +36,23 @@ from Cython.Build import cythonize
 from setuptools import Extension, setup
 
 extensions = [
-    Extension("ranvar.ranvar", ["ranvar/ranvar.py"]),
-    # Extension("ranvar.vm", ["ranvar/vm.py"]),
-    # Extension("ranvar.digest", ["ranvar/digest.py"], include_dirs=[np.get_include()]),
+    Extension("ranvar2.ranvar", ["ranvar2/ranvar.py"]),
+    # Extension("ranvar2.vm", ["ranvar2/vm.py"]),
+    # Extension("ranvar2.digest", ["ranvar2/digest.py"], include_dirs=[np.get_include()]),
     # Extension(
-    #     "ranvar.cdigest",
-    #     sources=["ranvar/cdigest.pyx"],
-    #     include_dirs=[np.get_include(), "ranvar/cpp"],
+    #     "ranvar2.cdigest",
+    #     sources=["ranvar2/cdigest.pyx"],
+    #     include_dirs=[np.get_include(), "ranvar2/cpp"],
     #     language="c++",
     #     extra_compile_args=["-std=c++17"],
     # ),
 ]
 
 setup(
-    name="ranvar",
+    name="ranvar2",
     ext_modules=cythonize(
         extensions,
-        include_path=["ranvar/", np.get_include()],
+        include_path=["ranvar2/", np.get_include()],
         force=True,
         annotate=True,
     ),

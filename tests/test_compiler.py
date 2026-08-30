@@ -1,7 +1,7 @@
 import cython
 import math
 
-import ranvar as mc
+import ranvar2 as mc
 import numpy as np
 import pytest
 

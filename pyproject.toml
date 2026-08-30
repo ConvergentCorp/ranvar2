@@ -1,5 +1,5 @@
 [project]
-name = "ranvar"
+name = "ranvar2"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
@@ -18,4 +18,4 @@ requires = ["setuptools>=77", "cython>=3.3.0", "numpy>=2.5.2"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["ranvar"]
+packages = ["ranvar2"]
