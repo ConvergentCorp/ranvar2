@@ -9,6 +9,16 @@ from cython.cimports.libc.stdlib import rand as crand
 from cython.cimports.libc.stdlib import srand as csrand
 from cython.cimports.libc.stdlib import RAND_MAX as C_RAND_MAX
 
+from cython.cimports.libc.math import log as clog
+from cython.cimports.libc.math import sqrt as csqrt
+from cython.cimports.libc.math import cos as ccos
+from cython.cimports.libc.math import exp as cexp
+from cython.cimports.libc.math import floor as cfloor
+from cython.cimports.libc.math import fabs as cfabs
+from cython.cimports.libc.math import lgamma as clgamma
+from cython.cimports.libc.math import pow as cpow
+from cython.cimports.libc.math import M_PI
+
 
 def seed(value):
     """Seed the random number generator that sample() draws from.
@@ -718,4 +728,367 @@ class RanVar():
         # the constructor. Repeated here so the rule that any change to the
         # centroids invalidates the ladder holds wherever they are assigned.
         self._stale = 1
-    
+
+
+# Sampling helpers for the parametric subclasses. ------------------------------
+#
+# Free functions rather than methods, since Normal and NegBinom both need a
+# standard normal draw (NegBinom by way of its gamma sampler) and there is
+# nothing instance specific about generating one. All draw from the same
+# process-global C generator seed() controls, consistent with RanVar.sample().
+
+@cfunc
+@cdivision(True)
+def _uniform() -> cdouble:
+    """Draw from the open interval (0, 1), never exactly 0 or 1.
+
+    Box-Muller and the gamma sampler below both take a log of this, so the
+    closed end at 0 that crand() can in principle return would blow up to
+    -inf.
+
+    Returns:
+        float: A uniform draw strictly between 0 and 1.
+    """
+    u: cdouble = cast(cdouble, crand()) / cast(cdouble, C_RAND_MAX)
+
+    while u <= 0.0 or u >= 1.0:
+        u = cast(cdouble, crand()) / cast(cdouble, C_RAND_MAX)
+
+    return u
+
+
+@cfunc
+@cdivision(True)
+def _standardNormal() -> cdouble:
+    """Draw one N(0, 1) value using the Box-Muller transform.
+
+    Returns:
+        float: A value drawn from the standard normal distribution.
+    """
+    u1: cdouble = _uniform()
+    u2: cdouble = _uniform()
+
+    return csqrt(-2.0 * clog(u1)) * ccos(2.0 * M_PI * u2)
+
+
+@cfunc
+@cdivision(True)
+def _sampleGamma(shape: cdouble, scale: cdouble) -> cdouble:
+    """Draw from Gamma(shape, scale) by Marsaglia and Tsang (2000).
+
+    The squeeze below needs shape >= 1; a shape under 1 is boosted by one,
+    sampled, and then shrunk back down by an independent uniform variate
+    raised to 1/shape, the standard way to extend the method to the full
+    positive range.
+
+    Args:
+        shape (float): The gamma shape parameter, must be positive.
+        scale (float): The gamma scale parameter, must not be negative.
+
+    Returns:
+        float: A value drawn from Gamma(shape, scale).
+    """
+    boost: cdouble = 1.0
+    d: cdouble
+    c: cdouble
+    x: cdouble
+    v: cdouble
+    u: cdouble
+
+    if shape < 1.0:
+        boost = cpow(_uniform(), 1.0 / shape)
+        shape = shape + 1.0
+
+    d = shape - 1.0 / 3.0
+    c = 1.0 / csqrt(9.0 * d)
+
+    while True:
+        v = -1.0
+        while v <= 0.0:
+            x = _standardNormal()
+            v = 1.0 + c * x
+
+        v = v * v * v
+        u = _uniform()
+
+        if u < 1.0 - 0.0331 * x * x * x * x:
+            return boost * d * v * scale
+
+        if clog(u) < 0.5 * x * x + d * (1.0 - v + clog(v)):
+            return boost * d * v * scale
+
+
+@cfunc
+@cdivision(True)
+def _samplePoissonSmall(lam: cdouble) -> cdouble:
+    """Draw from Poisson(lam) following Knuth (1969).
+
+    Counts uniforms until their running product underflows exp(-lam). Exact,
+    and cheap for a small lam, but the expected number of iterations is lam,
+    so _samplePoisson() only routes here below its threshold.
+
+    Args:
+        lam (float): The Poisson rate, must not be negative.
+
+    Returns:
+        float: A value drawn from Poisson(lam), a non-negative integer held
+             as a float to match sample()'s return type.
+    """
+    enlam: cdouble = cexp(-lam)
+    prod: cdouble = 1.0
+    k: cdouble = 0.0
+
+    while True:
+        prod = prod * _uniform()
+
+        if prod <= enlam:
+            return k
+
+        k = k + 1.0
+
+
+@cfunc
+@cdivision(True)
+def _samplePoissonLarge(lam: cdouble) -> cdouble:
+    """Draw from Poisson(lam) by Hormann's transformed rejection method
+    (1993), used above the threshold where Knuth's method would need too
+    many iterations. The log-gamma term is evaluated with lgamma() from
+    math.h rather than tabulated, since k is unbounded.
+
+    Args:
+        lam (float): The Poisson rate, must be at least the threshold
+                   _samplePoisson() switches to this method at.
+
+    Returns:
+        float: A value drawn from Poisson(lam), a non-negative integer held
+             as a float to match sample()'s return type.
+    """
+    slam: cdouble = csqrt(lam)
+    loglam: cdouble = clog(lam)
+    b: cdouble = 0.931 + 2.53 * slam
+    a: cdouble = -0.059 + 0.02483 * b
+    invalpha: cdouble = 1.1239 + 1.1328 / (b - 3.4)
+    vr: cdouble = 0.9277 - 3.6224 / (b - 2.0)
+
+    U: cdouble
+    V: cdouble
+    us: cdouble
+    k: cdouble
+
+    while True:
+        U = _uniform() - 0.5
+        V = _uniform()
+        us = 0.5 - cfabs(U)
+        k = cfloor((2.0 * a / us + b) * U + lam + 0.43)
+
+        if (us >= 0.07) and (V <= vr):
+            return k
+
+        if (k < 0.0) or ((us < 0.013) and (V > us)):
+            continue
+
+        if (clog(V) + clog(invalpha) - clog(a / (us * us) + b)) <= (-lam + k * loglam - clgamma(k + 1.0)):
+            return k
+
+
+@cfunc
+def _samplePoisson(lam: cdouble) -> cdouble:
+    """Draw from Poisson(lam), routing to whichever method is cheap for lam.
+
+    Args:
+        lam (float): The Poisson rate, must not be negative.
+
+    Returns:
+        float: A value drawn from Poisson(lam).
+    """
+    if lam < 10.0:
+        return _samplePoissonSmall(lam)
+
+    return _samplePoissonLarge(lam)
+
+
+# Parametric distributions. -----------------------------------------------------
+#
+# Both subclass RanVar so a compiled model can still take them through a
+# parameter annotated RanVar: sample() is declared cpdef in ranvar.pxd, so
+# overriding it here gets dispatched through the vtable at the C level, the
+# same as any other virtual method, with no Python call involved.
+
+@cclass
+class Normal(RanVar):
+    """A digest that draws from a fixed Normal(mean, std) instead of data.
+
+    sample() overrides the base t-digest lookup with a direct Box-Muller
+    draw, so using a Normal as a compiled model's input costs one C call
+    rather than a binary search through fitted centroids. add()/fit() are
+    still inherited and work as they do on a plain RanVar, but sample()
+    always draws from the fixed parameters rather than anything they add.
+
+    """
+    _mean: cdouble
+    _std: cdouble
+
+    def __init__(self, mean=0.0, std=1.0, maxBins=32):
+        """Create a fixed Normal(mean, std) digest.
+
+        Args:
+            mean (float, optional): The distribution's mean. Defaults to 0.0.
+            std (float, optional): The distribution's standard deviation,
+                                 must be positive. Defaults to 1.0.
+            maxBins (int, optional): Passed through to RanVar, only relevant
+                                   if add()/fit() are also called on this
+                                   instance. Defaults to 32.
+
+        Raises:
+            ValueError: If std is not positive.
+        """
+        if std <= 0:
+            raise ValueError('std must be positive')
+
+        super().__init__(maxBins=maxBins)
+
+        self._mean = mean
+        self._std  = std
+
+    @ccall
+    @cdivision(True)
+    def sample(self) -> cdouble:
+        """Draw a value from Normal(mean, std).
+
+        Returns:
+            float: A value drawn from the distribution.
+        """
+        return self._mean + self._std * _standardNormal()
+
+    def mean(self):
+        """Return this distribution's fixed mean.
+
+        Unlike RanVar.mean(), which averages the fitted centroids, this
+        returns the parameter Normal was constructed with, since sample()
+        draws from that parameter rather than from anything added with
+        add()/fit().
+
+        Returns:
+            float: The distribution's mean.
+        """
+        return self._mean
+
+    def std(self):
+        """Return this distribution's fixed standard deviation.
+
+        Returns:
+            float: The distribution's standard deviation.
+        """
+        return self._std
+
+    def __reduce__(self):
+        """Support pickling and copying.
+
+        Returns:
+            tuple: The (callable, args, state) triple pickle expects.
+        """
+        return (
+            type(self), (self._mean, self._std, self.maxBins),
+            (self.nActive, self.bins, self.cnts),
+        )
+
+
+@cclass
+class NegBinom(RanVar):
+    """A digest that draws from a fixed NegBinom(mean, dispersion) instead of
+    data.
+
+    Parameterized the NB2 way: variance = mean + dispersion * mean**2, the
+    form regression and overdispersed count models usually fit. Internally
+    this is drawn as a Gamma-Poisson mixture, so dispersion may be any
+    positive real rather than only 1/integer.
+    """
+    _mean: cdouble
+    _dispersion: cdouble
+
+    _shape: cdouble
+    _scale: cdouble
+
+    def __init__(self, mean=1.0, dispersion=1.0, maxBins=32):
+        """Create a fixed NegBinom(mean, dispersion) digest.
+
+        Args:
+            mean (float, optional): The distribution's mean count, must not
+                                  be negative. Defaults to 1.0.
+            dispersion (float, optional): Overdispersion relative to a
+                                        same-mean Poisson, must be positive.
+                                        Defaults to 1.0.
+            maxBins (int, optional): Passed through to RanVar, only relevant
+                                   if add()/fit() are also called on this
+                                   instance. Defaults to 32.
+
+        Raises:
+            ValueError: If mean is negative or dispersion is not positive.
+        """
+        if mean < 0:
+            raise ValueError('mean must not be negative')
+
+        if dispersion <= 0:
+            raise ValueError('dispersion must be positive')
+
+        super().__init__(maxBins=maxBins)
+
+        self._mean       = mean
+        self._dispersion = dispersion
+
+        # shape = 1/dispersion, scale = mean/shape; cached so sample() only
+        # multiplies rather than converting on every draw.
+        self._shape = 1.0 / dispersion
+        self._scale = mean * dispersion
+
+    @ccall
+    @cdivision(True)
+    def sample(self) -> cdouble:
+        """Draw a value from NegBinom(mean, dispersion).
+
+        Draws a Gamma(shape, scale) rate and then a Poisson at that rate,
+        the standard Gamma-Poisson mixture representation of the negative
+        binomial, and what lets dispersion be a real number rather than only
+        1/integer.
+
+        Returns:
+            float: A value drawn from the distribution (a non-negative
+                 integer held as a float, consistent with quantile()
+                 elsewhere in this hierarchy).
+        """
+        rate: cdouble = _sampleGamma(self._shape, self._scale)
+
+        return _samplePoisson(rate)
+
+    def mean(self):
+        """Return this distribution's fixed mean.
+
+        Unlike RanVar.mean(), which averages the fitted centroids, this
+        returns the parameter NegBinom was constructed with, since sample()
+        draws from that parameter rather than from anything added with
+        add()/fit().
+
+        Returns:
+            float: The distribution's mean.
+        """
+        return self._mean
+
+    def dispersion(self):
+        """Return this distribution's fixed dispersion parameter.
+
+        Returns:
+            float: How much the variance exceeds a same-mean Poisson's.
+        """
+        return self._dispersion
+
+    def __reduce__(self):
+        """Support pickling and copying.
+
+        Returns:
+            tuple: The (callable, args, state) triple pickle expects.
+        """
+        return (
+            type(self), (self._mean, self._dispersion, self.maxBins),
+            (self.nActive, self.bins, self.cnts),
+        )
+

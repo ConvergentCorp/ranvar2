@@ -37,3 +37,25 @@ cdef class RanVar:
     cdef void _rebuildLadder(self)
     cpdef double quantile(self, double p)
     cpdef double sample(self)
+
+
+# Normal draws directly from its own parameters rather than a fitted digest, so
+# it only needs its two parameters on top of what RanVar already carries.
+cdef class Normal(RanVar):
+    cdef double _mean
+    cdef double _std
+
+    cpdef double sample(self)
+
+
+# NegBinom is parameterized by mean and dispersion (the NB2 form), and caches
+# the shape/scale of the Gamma half of its Gamma-Poisson mixture so sample()
+# only has to multiply rather than convert on every draw.
+cdef class NegBinom(RanVar):
+    cdef double _mean
+    cdef double _dispersion
+
+    cdef double _shape
+    cdef double _scale
+
+    cpdef double sample(self)

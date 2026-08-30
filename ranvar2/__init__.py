@@ -1,4 +1,4 @@
-from .ranvar import RanVar, seed
+from .ranvar import RanVar, Normal, NegBinom, seed
 from .decorators import func
 from .compiler import cfunc, RanVarCompileError
 
@@ -6,4 +6,7 @@ from .compiler import cfunc, RanVarCompileError
 # as an alias because that is the name the tests and the older code use.
 Digest = RanVar
 
-__all__ = ["RanVar", "Digest", "func", "cfunc", "seed", "RanVarCompileError"]
+__all__ = [
+    "RanVar", "Digest", "Normal", "NegBinom", "func", "cfunc", "seed",
+    "RanVarCompileError",
+]
