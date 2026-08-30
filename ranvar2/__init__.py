@@ -1,4 +1,6 @@
-from .ranvar import RanVar, Normal, NegBinom, Constant, RanVarArray, seed
+from .ranvar import (
+    RanVar, Normal, NegBinom, Constant, RanVarArray, asRanVar, seed,
+)
 from .decorators import func
 from .compiler import cfunc, RanVarCompileError
 
@@ -8,5 +10,5 @@ Digest = RanVar
 
 __all__ = [
     "RanVar", "Digest", "Normal", "NegBinom", "Constant", "RanVarArray",
-    "func", "cfunc", "seed", "RanVarCompileError",
+    "asRanVar", "func", "cfunc", "seed", "RanVarCompileError",
 ]

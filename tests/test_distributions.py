@@ -19,6 +19,19 @@ def identity(x: mc.RanVar) -> cython.double:
 compiledIdentity = mc.cfunc(identity, samples=200_000)
 
 
+def totalOf(xs: mc.RanVarArray) -> cython.double:
+    """A model that draws from every digest it is given and sums them."""
+    total: cython.double = 0.0
+
+    for x in xs:
+        total += ~x
+
+    return total
+
+
+compiledSum = mc.cfunc(totalOf, samples=200_000)
+
+
 def empiricalMoments(digest):
     """Compute the mean and variance a compiled model's output digest holds."""
     bins    = digest.getBins()
@@ -549,6 +562,82 @@ def test_constant_fit_needs_at_least_one_point():
     """Tests that fit() refuses an empty collection."""
     with pytest.raises(ValueError):
         Constant().fit([])
+
+
+# asRanVar. -------------------------------------------------------------------
+
+@pytest.mark.parametrize('value', [
+    RanVar(),
+    Normal(mean=1.0, std=1.0),
+    NegBinom(mean=1.0, dispersion=1.0),
+    Constant(value=1.0),
+    mc.RanVarArray.fromList([Constant(value=1.0)]),
+])
+def test_asranvar_passes_digests_through_unchanged(value):
+    """Tests that anything already usable as a model argument -- every RanVar
+    subclass, and a RanVarArray -- comes back as the same object.
+    """
+    assert mc.asRanVar(value) is value
+
+
+@pytest.mark.parametrize('number', [7, 7.0, -2.5, 0, True, np.int64(7), np.float64(7.0)])
+def test_asranvar_wraps_a_number_in_a_constant(number):
+    """Tests that a real number becomes a Constant sitting on it, numpy
+    scalars (np.int64 is not an int subclass) included.
+    """
+    out = mc.asRanVar(number)
+
+    assert isinstance(out, Constant)
+    assert out.value() == float(number)
+
+
+@pytest.mark.parametrize('sequence', [list, tuple])
+def test_asranvar_wraps_a_sequence_in_a_ranvararray(sequence):
+    """Tests that a list or tuple becomes a RanVarArray, with every element
+    coerced too, so a list of plain numbers works as well as one of digests.
+    """
+    normal = Normal(mean=2.0, std=1.0)
+    out    = mc.asRanVar(sequence([1.0, normal]))
+
+    assert isinstance(out, mc.RanVarArray)
+    assert len(out) == 2
+    assert isinstance(out[0], Constant)
+    assert out[0].value() == 1.0
+    assert out[1] is normal
+
+
+def test_asranvar_wraps_an_empty_list():
+    """Tests that an empty list gives an empty array rather than refusing."""
+    out = mc.asRanVar([])
+
+    assert isinstance(out, mc.RanVarArray)
+    assert len(out) == 0
+
+
+@pytest.mark.parametrize('value', ['5', None, {'a': 1}, object(), [[1.0]]])
+def test_asranvar_refuses_what_it_cannot_convert(value):
+    """Tests that anything else raises rather than being passed on to fail
+    later inside a compiled model. A nested list reports the same way, from
+    the RanVarArray that would have had to hold one.
+    """
+    with pytest.raises(TypeError):
+        mc.asRanVar(value)
+
+
+def test_asranvar_output_runs_in_a_compiled_model():
+    """Tests that what asRanVar returns is what a compiled model accepts:
+    a plain number and a plain list go in, and the model runs at C speed on
+    the digests they became.
+    """
+    mc.seed(10)
+
+    out = compiledIdentity(mc.asRanVar(3.0))
+
+    assert out.mean() == pytest.approx(3.0)
+
+    total = compiledSum(mc.asRanVar([1.0, 2.0, Constant(value=4.0)]))
+
+    assert total.mean() == pytest.approx(7.0)
 
 
 # Every public RanVar method is present, whether inherited unchanged (the

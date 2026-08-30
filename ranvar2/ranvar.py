@@ -1,3 +1,5 @@
+import numbers
+
 import numpy  as np
 from cython import cclass, cfunc, boundscheck, initializedcheck, wraparound, ccall, cdivision, cast
 
@@ -2095,3 +2097,53 @@ class RanVarArray():
         """
         return (RanVarArray, (list(self._items),))
 
+
+# Coercion. --------------------------------------------------------------------
+
+def asRanVar(x):
+    """Coerce a value into the RanVar (or RanVarArray) a model takes.
+
+    A model's parameters are digests, but the values a caller has on hand are
+    often plain numbers -- a lead time of 7, a price held fixed -- or a plain
+    list of digests rather than a RanVarArray. This wraps those, so a caller
+    can pass whatever it holds and a model that is stochastic in a parameter
+    today still works when that parameter is a constant tomorrow.
+
+    Args:
+        x (object): The value to coerce. A RanVar (Normal, NegBinom, Constant
+                  and any other subclass included) or a RanVarArray is
+                  returned unchanged; a real number becomes a Constant; a list
+                  or tuple becomes a RanVarArray, with every element coerced
+                  the same way, so a list of plain numbers works as well as a
+                  list of digests.
+
+    Returns:
+        RanVar | RanVarArray: x itself, or the digest wrapping it.
+
+    Raises:
+        TypeError: If x is none of those. A nested list reports the same way,
+                 from the RanVarArray it would have had to hold.
+
+    Example:
+        >>> asRanVar(7).sample()
+        7.0
+        >>> len(asRanVar([1.0, Normal(mean=2.0, std=1.0)]))
+        2
+    """
+    if isinstance(x, (RanVar, RanVarArray)):
+        return x
+
+    if isinstance(x, (list, tuple)):
+        return RanVarArray([asRanVar(item) for item in x])
+
+    # numbers.Real rather than (int, float), so that the numpy scalars a
+    # dataframe hands out (np.int64 among them, which is not an int subclass)
+    # are wrapped rather than refused.
+    if isinstance(x, numbers.Real):
+        return Constant(float(x))
+
+    raise TypeError(
+        f'asRanVar() cannot convert {type(x).__name__!r}: it takes a RanVar, '
+        f'a RanVarArray, a real number (wrapped in a Constant), or a list of '
+        f'those (wrapped in a RanVarArray)'
+    )

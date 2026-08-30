@@ -240,6 +240,30 @@ or a slice of it, rather than a single element) and reading a `RanVarArray`
 from the surrounding module (rather than taking it as a parameter) are all
 refused for the same reason a bare `RanVar` would be.
 
+### `asRanVar`: coercing model inputs
+
+A model's parameters are digests, but what a caller has on hand is often a
+plain number or a plain list. `asRanVar` wraps those, and passes anything
+already usable through unchanged:
+
+```python
+from ranvar2 import asRanVar
+
+asRanVar(7)                      # Constant(value=7.0)
+asRanVar(np.int64(7))            # Constant too: any real number, numpy scalars included
+asRanVar([1.0, Normal(5, 1)])    # RanVarArray, each element coerced in turn
+asRanVar(Normal(5, 1))           # unchanged
+asRanVar(someRanVarArray)        # unchanged
+```
+
+Anything else raises `TypeError` rather than being passed on to fail deeper
+inside a compiled model. The point is that a model stochastic in a parameter
+today keeps working when that parameter is a constant tomorrow:
+
+```python
+self.D = self._model(asRanVar(demand), asRanVar(leadTime), asRanVar(cycle))
+```
+
 ### Reproducibility
 
 Sampling draws from a single process-global C generator (`rand()`/`srand()`
