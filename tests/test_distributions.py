@@ -63,14 +63,19 @@ def test_normal_sample_matches_its_parameters():
     assert xs.std()  == pytest.approx(8.0, abs=0.15)
 
 
-def test_normal_pickles():
-    """Tests that a Normal round trips through pickle with its parameters."""
+def test_normal_pickles_to_the_same_class():
+    """Tests that a Normal round trips through pickle as a Normal, with its
+    parameters intact, rather than unpickling to the plain RanVar base.
+    """
     n  = Normal(mean=7.0, std=2.0)
     n2 = pickle.loads(pickle.dumps(n))
 
+    assert type(n2) is Normal
     assert n2.mean() == 7.0
     assert n2.std() == 2.0
-    assert isinstance(n2, Normal)
+
+    n3 = pickle.loads(pickle.dumps(n2))
+    assert type(n3) is Normal
 
 
 def test_normal_compiles_through_a_ranvar_annotated_model():
@@ -133,6 +138,45 @@ def test_normal_quantile_is_not_implemented():
         Normal(mean=0.0, std=1.0).quantile(0.5)
 
 
+def test_normal_add_is_not_implemented():
+    """Tests that add() refuses rather than silently building a t-digest
+    sample() would then ignore.
+    """
+    with pytest.raises(NotImplementedError):
+        Normal(mean=0.0, std=1.0).add(1.0)
+
+
+def test_normal_fit_reestimates_mean_and_std():
+    """Tests that fit() replaces mean/std with the sample's, by the method
+    of moments (sample std, Bessel's correction), rather than adding points
+    to a digest sample() would then ignore.
+    """
+    data = [10.0, 12.0, 8.0, 11.0, 9.0, 13.0, 7.0, 10.0]
+
+    n = Normal(mean=0.0, std=1.0)
+    n.fit(data)
+
+    assert n.mean() == pytest.approx(np.mean(data))
+    assert n.std()  == pytest.approx(np.std(data, ddof=1))
+
+    # sample() draws from the newly fit parameters, not the constructor's.
+    mc.seed(6)
+    xs = np.array([n.sample() for _ in range(200_000)])
+    assert xs.mean() == pytest.approx(n.mean(), abs=0.1)
+    assert xs.std()  == pytest.approx(n.std(), abs=0.1)
+
+
+def test_normal_fit_needs_at_least_two_points():
+    """Tests that fit() refuses data a standard deviation can't be read
+    from, rather than silently producing a std of 0 or nan.
+    """
+    with pytest.raises(ValueError):
+        Normal(mean=0.0, std=1.0).fit([5.0])
+
+    with pytest.raises(ValueError):
+        Normal(mean=0.0, std=1.0).fit([])
+
+
 # NegBinom. ------------------------------------------------------------------
 
 def test_negbinom_is_a_ranvar():
@@ -163,14 +207,19 @@ def test_negbinom_accessors():
     assert nb.dispersion() == 0.25
 
 
-def test_negbinom_pickles():
-    """Tests that a NegBinom round trips through pickle with its parameters."""
+def test_negbinom_pickles_to_the_same_class():
+    """Tests that a NegBinom round trips through pickle as a NegBinom, with
+    its parameters intact, rather than unpickling to the plain RanVar base.
+    """
     nb  = NegBinom(mean=9.0, dispersion=2.0)
     nb2 = pickle.loads(pickle.dumps(nb))
 
+    assert type(nb2) is NegBinom
     assert nb2.mean() == 9.0
     assert nb2.dispersion() == 2.0
-    assert isinstance(nb2, NegBinom)
+
+    nb3 = pickle.loads(pickle.dumps(nb2))
+    assert type(nb3) is NegBinom
 
 
 def test_negbinom_zero_mean_is_degenerate():
@@ -254,13 +303,64 @@ def test_negbinom_has_no_closed_form_for(method, arg):
         getattr(nb, method)(arg)
 
 
+def test_negbinom_add_is_not_implemented():
+    """Tests that add() refuses rather than silently building a t-digest
+    sample() would then ignore.
+    """
+    with pytest.raises(NotImplementedError):
+        NegBinom(mean=1.0, dispersion=1.0).add(1.0)
+
+
+def test_negbinom_fit_reestimates_mean_and_dispersion():
+    """Tests that fit() replaces mean/dispersion with the sample's, by
+    inverting NegBinom's own variance = mean + dispersion * mean**2 with the
+    sample mean and sample variance (Bessel's correction), rather than
+    adding points to a digest sample() would then ignore.
+    """
+    counts = [2, 5, 0, 8, 1, 9, 3, 12, 0, 4]
+
+    nb = NegBinom(mean=1.0, dispersion=1.0)
+    nb.fit(counts)
+
+    sampleMean = np.mean(counts)
+    sampleVar  = np.var(counts, ddof=1)
+    expectedDispersion = (sampleVar - sampleMean) / sampleMean ** 2
+
+    assert nb.mean() == pytest.approx(sampleMean)
+    assert nb.dispersion() == pytest.approx(expectedDispersion)
+
+    # sample() draws from the newly fit parameters, not the constructor's.
+    mc.seed(7)
+    xs       = np.array([nb.sample() for _ in range(200_000)])
+    expected = sampleMean + expectedDispersion * sampleMean ** 2
+
+    assert xs.mean() == pytest.approx(sampleMean, rel=0.05, abs=0.1)
+    assert xs.var()  == pytest.approx(expected, rel=0.1)
+
+
+@pytest.mark.parametrize('data', [
+    [5.0],           # fewer than 2 points
+    [],               # no points
+    [0.0, 0.0, 0.0],  # zero sample mean
+    [5.0, 5.0, 5.0],  # underdispersed: sample variance == 0 < mean
+])
+def test_negbinom_fit_rejects_data_with_no_valid_dispersion(data):
+    """Tests that fit() refuses data that cannot yield a positive
+    dispersion, rather than silently producing a negative or undefined one.
+    """
+    with pytest.raises(ValueError):
+        NegBinom(mean=1.0, dispersion=1.0).fit(data)
+
+
 # Every public RanVar method is present, whether inherited unchanged (the
-# digest-building and digest-reading ones), overridden analytically, or
-# overridden to refuse. --------------------------------------------------------
+# ones with no data dependency), overridden analytically, or overridden to
+# refuse. Digest-only accessors (getActiveBinCount/getBins/getWeights) are
+# not part of this contract, since add()/fit() no longer build a digest for
+# either subclass. --------------------------------------------------------
 
 PUBLIC_METHODS = [
-    'add', 'getActiveBinCount', 'getBins', 'getWeights', 'lower', 'upper',
-    'cdf', 'ccdf', 'dcdf', 'dccdf', 'quantile', 'sample', 'mean', 'fit',
+    'add', 'lower', 'upper', 'cdf', 'ccdf', 'dcdf', 'dccdf', 'quantile',
+    'sample', 'mean', 'fit',
 ]
 
 
@@ -274,23 +374,3 @@ def test_all_public_ranvar_methods_are_present(cls, kwargs):
 
     for name in PUBLIC_METHODS:
         assert hasattr(instance, name), f'{cls.__name__} is missing {name}()'
-
-
-def test_add_and_fit_still_build_an_empirical_digest():
-    """Tests that add()/fit() keep working on the parametric subclasses.
-
-    They are generic t-digest operations, unrelated to sample()'s analytical
-    draw, so nothing about overriding sample()/mean()/etc. should disable
-    them.
-    """
-    n = Normal(mean=0.0, std=1.0)
-    n.fit([1.0, 2.0, 3.0])
-
-    assert n.getActiveBinCount() == 3
-    np.testing.assert_array_equal(n.getBins(), [1.0, 2.0, 3.0])
-    np.testing.assert_array_equal(n.getWeights(), [1.0, 1.0, 1.0])
-
-    nb = NegBinom(mean=1.0, dispersion=1.0)
-    nb.add(4.0)
-
-    assert nb.getActiveBinCount() == 1

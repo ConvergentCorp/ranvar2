@@ -923,10 +923,11 @@ class Normal(RanVar):
 
     sample() overrides the base t-digest lookup with a direct Box-Muller
     draw, so using a Normal as a compiled model's input costs one C call
-    rather than a binary search through fitted centroids. add()/fit() are
-    still inherited and work as they do on a plain RanVar, but sample()
-    always draws from the fixed parameters rather than anything they add.
-
+    rather than a binary search through fitted centroids. fit() is
+    overridden to match: it re-estimates mean and std analytically by the
+    method of moments rather than accumulating points into a digest, and
+    add() is refused outright, since a single point cannot estimate a
+    spread.
     """
     _mean: cdouble
     _std: cdouble
@@ -938,9 +939,9 @@ class Normal(RanVar):
             mean (float, optional): The distribution's mean. Defaults to 0.0.
             std (float, optional): The distribution's standard deviation,
                                  must be positive. Defaults to 1.0.
-            maxBins (int, optional): Passed through to RanVar, only relevant
-                                   if add()/fit() are also called on this
-                                   instance. Defaults to 32.
+            maxBins (int, optional): Passed through to RanVar. Unused by
+                                   Normal itself, since neither add() nor
+                                   fit() builds a digest here. Defaults to 32.
 
         Raises:
             ValueError: If std is not positive.
@@ -967,9 +968,9 @@ class Normal(RanVar):
         """Return this distribution's fixed mean.
 
         Unlike RanVar.mean(), which averages the fitted centroids, this
-        returns the parameter Normal was constructed with, since sample()
-        draws from that parameter rather than from anything added with
-        add()/fit().
+        returns the parameter Normal currently holds, from construction or
+        the last fit(), since sample() draws from that parameter rather than
+        from any digest.
 
         Returns:
             float: The distribution's mean.
@@ -984,12 +985,58 @@ class Normal(RanVar):
         """
         return self._std
 
+    def add(self, point, count=1.0):
+        """Not implemented: a single point cannot estimate a spread.
+
+        RanVar.add() appends one point to a t-digest. Normal instead only
+        supports re-estimating both of its parameters at once from a full
+        collection, via fit(), since mean and std cannot be estimated
+        analytically from a single point.
+
+        Raises:
+            NotImplementedError: Always.
+        """
+        raise NotImplementedError(
+            'Normal.add() is not supported: a single point cannot estimate '
+            'a standard deviation. Use fit() with a full collection of data '
+            'instead.'
+        )
+
+    def fit(self, x):
+        """Re-estimate mean and std from data by the method of moments.
+
+        Unlike RanVar.fit(), which adds every point to a t-digest, this
+        replaces Normal's own parameters outright with the sample mean and
+        the sample standard deviation of x (Bessel's correction, dividing by
+        n - 1), the closed-form estimator for a normal distribution's
+        parameters.
+
+        Args:
+            x (iterable): Data to estimate mean and std from. Needs at least
+                         2 points, since a single point cannot estimate a
+                         spread.
+
+        Raises:
+            ValueError: If x has fewer than 2 points.
+        """
+        values = list(x)
+        n      = len(values)
+
+        if n < 2:
+            raise ValueError('fit() needs at least 2 points to estimate a standard deviation')
+
+        mean = sum(values) / n
+        var  = sum((v - mean) ** 2 for v in values) / (n - 1)
+
+        self._mean = mean
+        self._std  = var ** 0.5
+
     def lower(self):
         """Return this distribution's lower support bound.
 
         Unlike RanVar.lower(), which reads the smallest fitted centroid, this
-        is the bound of Normal's own support and does not depend on whether
-        anything has been added with add()/fit().
+        is the bound of Normal's own support and does not depend on its
+        current mean or std.
 
         Returns:
             float: -inf, since a normal distribution has unbounded support.
@@ -1103,6 +1150,11 @@ class NegBinom(RanVar):
     form regression and overdispersed count models usually fit. Internally
     this is drawn as a Gamma-Poisson mixture, so dispersion may be any
     positive real rather than only 1/integer.
+
+    fit() re-estimates mean and dispersion analytically by inverting that
+    same variance formula from a sample's moments, rather than accumulating
+    points into a digest, and add() is refused outright, since a single
+    point cannot estimate a variance.
     """
     _mean: cdouble
     _dispersion: cdouble
@@ -1119,9 +1171,9 @@ class NegBinom(RanVar):
             dispersion (float, optional): Overdispersion relative to a
                                         same-mean Poisson, must be positive.
                                         Defaults to 1.0.
-            maxBins (int, optional): Passed through to RanVar, only relevant
-                                   if add()/fit() are also called on this
-                                   instance. Defaults to 32.
+            maxBins (int, optional): Passed through to RanVar. Unused by
+                                   NegBinom itself, since neither add() nor
+                                   fit() builds a digest here. Defaults to 32.
 
         Raises:
             ValueError: If mean is negative or dispersion is not positive.
@@ -1134,6 +1186,16 @@ class NegBinom(RanVar):
 
         super().__init__(maxBins=maxBins)
 
+        self._setParams(mean, dispersion)
+
+    def _setParams(self, mean, dispersion):
+        """Set mean and dispersion, and the cache sample() draws from.
+
+        Args:
+            mean (float): The distribution's mean count.
+            dispersion (float): Overdispersion relative to a same-mean
+                              Poisson.
+        """
         self._mean       = mean
         self._dispersion = dispersion
 
@@ -1165,9 +1227,9 @@ class NegBinom(RanVar):
         """Return this distribution's fixed mean.
 
         Unlike RanVar.mean(), which averages the fitted centroids, this
-        returns the parameter NegBinom was constructed with, since sample()
-        draws from that parameter rather than from anything added with
-        add()/fit().
+        returns the parameter NegBinom currently holds, from construction or
+        the last fit(), since sample() draws from that parameter rather than
+        from any digest.
 
         Returns:
             float: The distribution's mean.
@@ -1182,13 +1244,72 @@ class NegBinom(RanVar):
         """
         return self._dispersion
 
+    def add(self, point, count=1.0):
+        """Not implemented: a single point cannot estimate a variance.
+
+        RanVar.add() appends one point to a t-digest. NegBinom instead only
+        supports re-estimating both of its parameters at once from a full
+        collection, via fit(), since mean and dispersion cannot be estimated
+        analytically from a single point.
+
+        Raises:
+            NotImplementedError: Always.
+        """
+        raise NotImplementedError(
+            'NegBinom.add() is not supported: a single point cannot '
+            'estimate a variance. Use fit() with a full collection of data '
+            'instead.'
+        )
+
+    def fit(self, x):
+        """Re-estimate mean and dispersion from data by the method of
+        moments.
+
+        Unlike RanVar.fit(), which adds every point to a t-digest, this
+        replaces NegBinom's own parameters outright by inverting its own
+        variance = mean + dispersion * mean**2 parameterization with the
+        sample mean and sample variance of x (Bessel's correction, dividing
+        by n - 1): dispersion = (variance - mean) / mean**2.
+
+        Args:
+            x (iterable): Data to estimate mean and dispersion from. Needs at
+                         least 2 points, a positive sample mean, and to be
+                         overdispersed relative to a same-mean Poisson
+                         (sample variance > sample mean), or there is no
+                         positive dispersion that fits it.
+
+        Raises:
+            ValueError: If x has fewer than 2 points, a non-positive sample
+                      mean, or is not overdispersed.
+        """
+        values = list(x)
+        n      = len(values)
+
+        if n < 2:
+            raise ValueError('fit() needs at least 2 points to estimate a variance')
+
+        mean = sum(values) / n
+
+        if mean <= 0:
+            raise ValueError('fit() needs a positive sample mean to estimate dispersion')
+
+        var        = sum((v - mean) ** 2 for v in values) / (n - 1)
+        dispersion = (var - mean) / (mean * mean)
+
+        if dispersion <= 0:
+            raise ValueError(
+                'fit() needs overdispersed data (sample variance > sample '
+                'mean) to estimate a positive dispersion'
+            )
+
+        self._setParams(mean, dispersion)
+
     def lower(self):
         """Return this distribution's lower support bound.
 
         Unlike RanVar.lower(), which reads the smallest fitted centroid, this
         is the bound of NegBinom's own support (a count, so it starts at 0)
-        and does not depend on whether anything has been added with
-        add()/fit().
+        and does not depend on its current mean or dispersion.
 
         Returns:
             float: 0.0, the smallest count NegBinom can draw.
