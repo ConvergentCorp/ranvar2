@@ -53,17 +53,19 @@ for yet — while still running at C speed inside a `@cfunc` model.
 
 ## Installation
 
-Not published to PyPI yet — install directly from GitHub. With
+This is a private repo, not published to PyPI — install directly from
+GitHub over SSH (or an HTTPS URL that carries credentials, e.g. via `gh
+auth setup-git`), as an org member with access. With
 [uv](https://docs.astral.sh/uv/):
 
 ```sh
-uv add git+https://github.com/ajvogel/ranvar2.git
+uv add git+ssh://git@github.com/ConvergentCorp/ranvar2.git
 ```
 
 Or with pip:
 
 ```sh
-pip install git+https://github.com/ajvogel/ranvar2.git
+pip install git+ssh://git@github.com/ConvergentCorp/ranvar2.git
 ```
 
 To pin a specific commit or tag, append `@<ref>` to the URL.
@@ -170,7 +172,7 @@ seed(1234)   # make every following draw in this process reproducible
 ## Development
 
 ```sh
-git clone https://github.com/ajvogel/ranvar2.git
+git clone git@github.com:ConvergentCorp/ranvar2.git
 cd ranvar2
 uv sync
 uv run pytest
