@@ -264,6 +264,42 @@ today keeps working when that parameter is a constant tomorrow:
 self.D = self._model(asRanVar(demand), asRanVar(leadTime), asRanVar(cycle))
 ```
 
+### `toDict` / `fromDict`: storing a distribution
+
+Every `RanVar` serialises to plain JSON types, and comes back as the class
+that wrote it:
+
+```python
+payload = NegBinom(mean=3.0, dispersion=0.8).toDict()
+# {'type': 'NegBinom', 'mean': 3.0, 'dispersion': 0.8, 'maxBins': 32}
+
+RanVar.fromDict(payload)        # NegBinom, not a bare RanVar
+```
+
+A fitted digest writes its centroids (`bins`, `weights`, `nActive`,
+`maxBins`) — the same values pickling carries, so the restored digest
+answers `quantile()` identically and keeps taking points. The parametric
+subclasses write their parameters instead, since neither `add()` nor `fit()`
+builds a digest for them.
+
+`fromDict` is a classmethod on `RanVar` that dispatches on the payload's
+`type` key by walking the live subclass tree, so a subclass defined in your
+own code is found with no registration step. Reached through a subclass it
+narrows: `Normal.fromDict(...)` rebuilds a `Normal` payload and refuses
+anything else. A payload naming no known `RanVar`, or missing a field the
+class needs, raises `ValueError` rather than guessing.
+
+A subclass that carries state of its own overrides `toDict()` and the
+`_fromDict()` hook that fromDict calls once it has resolved the class:
+
+```python
+class Doubled(Constant):
+    def sample(self):
+        return 2.0 * self.value()
+
+RanVar.fromDict(Doubled(value=3.0).toDict())   # Doubled, inheriting both
+```
+
 ### Reproducibility
 
 Sampling draws from a single process-global C generator (`rand()`/`srand()`

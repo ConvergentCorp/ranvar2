@@ -694,6 +694,154 @@ class RanVar():
             self._add(xx, 1.0)
 
 
+    def toDict(self):
+        """Serialise this digest to plain JSON types.
+
+        A t-digest is fully described by its centroid positions, their
+        weights, the bin ceiling and how many centroids are live -- the same
+        values __reduce__ hands the unpickler -- so this is a faithful
+        representation rather than a summary of one.
+
+        The payload names the class that wrote it, which is what lets
+        fromDict() rebuild a subclass rather than a bare RanVar. Subclasses
+        that carry parameters instead of centroids override this, but they
+        keep the type key.
+
+        Returns:
+            dict: The digest, as JSON types only.
+        """
+        return {
+            'type':    type(self).__name__,
+            'maxBins': self.maxBins,
+            'nActive': self.nActive,
+            'bins':    self.getBins().tolist(),
+            'weights': self.getWeights().tolist(),
+        }
+
+    @classmethod
+    def fromDict(cls, data):
+        """Rebuild whatever wrote a payload, as the class that wrote it.
+
+        Dispatches on the payload's type key: a Normal comes back a Normal,
+        a NegBinom a NegBinom, and so on for any RanVar subclass, including
+        one defined outside this module. Reached through a subclass
+        (Normal.fromDict(...)) it additionally refuses a payload written by
+        something that is not that subclass, rather than quietly returning
+        another type.
+
+        Args:
+            data (dict): A payload from toDict().
+
+        Returns:
+            RanVar: The reconstructed distribution.
+
+        Raises:
+            ValueError: If the payload has no type key, names a class that is
+                      not a RanVar (or not a cls, when reached through a
+                      subclass), or is missing a field that class needs.
+        """
+        if not isinstance(data, dict) or 'type' not in data:
+            raise ValueError(
+                "a RanVar payload needs a 'type' key naming the class that "
+                "wrote it, as toDict() writes one"
+            )
+
+        name   = data['type']
+        target = RanVar._named(name)
+
+        if target is None:
+            raise ValueError(f'{name!r} is not a known RanVar class')
+
+        if not issubclass(target, cls):
+            raise ValueError(
+                f'{name!r} is not a {cls.__name__}, so {cls.__name__}.'
+                f'fromDict() will not rebuild it. Use RanVar.fromDict() to '
+                f'accept any of them'
+            )
+
+        try:
+            return target._fromDict(data)
+        except KeyError as missing:
+            raise ValueError(
+                f'{name} payload is missing {missing.args[0]!r}'
+            ) from missing
+
+    @classmethod
+    def _named(cls, name):
+        """Find the RanVar subclass a payload's type key names.
+
+        Walks the live subclass tree rather than a registry, so a subclass
+        defined outside this module is found as well, with no registration
+        step for a caller to forget.
+
+        Args:
+            name (str): The class name to look for.
+
+        Returns:
+            type: The class, or None if no RanVar goes by that name.
+        """
+        pending = [RanVar]
+
+        while pending:
+            found = pending.pop()
+
+            if found.__name__ == name:
+                return found
+
+            pending.extend(found.__subclasses__())
+
+        return None
+
+    @classmethod
+    def _fromDict(cls, data):
+        """Rebuild a digest from its own payload.
+
+        The hook fromDict() calls once it has resolved the class. Every
+        subclass that overrides toDict() overrides this to match, which is
+        what keeps the dispatch in one place rather than in every class.
+
+        Args:
+            data (dict): A payload from toDict().
+
+        Returns:
+            RanVar: The reconstructed digest.
+
+        Raises:
+            ValueError: If the payload's centroids do not describe a digest
+                      of the size it claims.
+        """
+        maxBins = int(data['maxBins'])
+        nActive = int(data['nActive'])
+        bins    = data['bins']
+        weights = data['weights']
+
+        if len(bins) != nActive or len(weights) != nActive:
+            raise ValueError(
+                f'payload claims {nActive} centroids but carries '
+                f'{len(bins)} of them and {len(weights)} weights'
+            )
+
+        if nActive > maxBins:
+            raise ValueError(
+                f'payload claims {nActive} centroids, more than the {maxBins} '
+                f'its bin ceiling allows'
+            )
+
+        digest = cls(maxBins=maxBins)
+
+        # The backing arrays are one longer than the ceiling (_add() writes
+        # into the spare slot before merging), and only the live prefix is
+        # serialised, so the rest is left at the zeros __init__ made.
+        centroids = np.zeros(maxBins + 1, dtype=np.float64)
+        counts    = np.zeros(maxBins + 1, dtype=np.float64)
+
+        centroids[:nActive] = bins
+        counts[:nActive]    = weights
+
+        digest.__setstate__((nActive, centroids, counts))
+
+        return digest
+
     def __invert__(self):
         """Syntactic sugar for the sample method.
 
@@ -1131,6 +1279,39 @@ class Normal(RanVar):
             'provide.'
         )
 
+    def toDict(self):
+        """Serialise this distribution to plain JSON types.
+
+        Unlike RanVar.toDict(), which writes the centroids, this writes the
+        two parameters sample() draws from: neither add() nor fit() builds a
+        digest here, so there are no centroids to carry.
+
+        Returns:
+            dict: The distribution, as JSON types only.
+        """
+        return {
+            'type':    type(self).__name__,
+            'mean':    self._mean,
+            'std':     self._std,
+            'maxBins': self.maxBins,
+        }
+
+    @classmethod
+    def _fromDict(cls, data):
+        """Rebuild a Normal from its own payload.
+
+        Args:
+            data (dict): A payload from toDict().
+
+        Returns:
+            Normal: The reconstructed distribution.
+        """
+        return cls(
+            mean=float(data['mean']),
+            std=float(data['std']),
+            maxBins=int(data['maxBins']),
+        )
+
     def __reduce__(self):
         """Support pickling and copying.
 
@@ -1450,6 +1631,39 @@ class NegBinom(RanVar):
             'math functions, for the same reason as NegBinom.cdf().'
         )
 
+    def toDict(self):
+        """Serialise this distribution to plain JSON types.
+
+        Written in the mean/dispersion form the class works in throughout,
+        whichever parameterization it was built from, since r/p is converted
+        away in __init__.
+
+        Returns:
+            dict: The distribution, as JSON types only.
+        """
+        return {
+            'type':       type(self).__name__,
+            'mean':       self._mean,
+            'dispersion': self._dispersion,
+            'maxBins':    self.maxBins,
+        }
+
+    @classmethod
+    def _fromDict(cls, data):
+        """Rebuild a NegBinom from its own payload.
+
+        Args:
+            data (dict): A payload from toDict().
+
+        Returns:
+            NegBinom: The reconstructed distribution.
+        """
+        return cls(
+            mean=float(data['mean']),
+            dispersion=float(data['dispersion']),
+            maxBins=int(data['maxBins']),
+        )
+
     def __reduce__(self):
         """Support pickling and copying.
 
@@ -1649,6 +1863,33 @@ class Constant(RanVar):
             float: The value.
         """
         return self._value
+
+    def toDict(self):
+        """Serialise this distribution to plain JSON types.
+
+        Only the point it sits on: a constant has no centroids, and add()
+        and fit() replace that point rather than building a digest.
+
+        Returns:
+            dict: The distribution, as JSON types only.
+        """
+        return {
+            'type':    type(self).__name__,
+            'value':   self._value,
+            'maxBins': self.maxBins,
+        }
+
+    @classmethod
+    def _fromDict(cls, data):
+        """Rebuild a Constant from its own payload.
+
+        Args:
+            data (dict): A payload from toDict().
+
+        Returns:
+            Constant: The reconstructed distribution.
+        """
+        return cls(value=float(data['value']), maxBins=int(data['maxBins']))
 
     def __reduce__(self):
         """Support pickling and copying.
