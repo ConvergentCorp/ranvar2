@@ -707,3 +707,68 @@ def test_seed_discards_a_held_normal_variate():
 
     mc.seed(11)
     assert [x.sample() for _ in range(20)] == first
+
+
+def test_seed_accepts_any_integer():
+    """Tests that seeding is total over the integers.
+
+    The seed is taken modulo 2**64 and expanded into the generator's state, so
+    a negative seed, zero, and one past the 64-bit range are all usable rather
+    than errors.
+    """
+    x = mc.Normal(0.0, 1.0)
+
+    for value in [0, 1, -1, -(2**63), 2**64 + 5, 2**128]:
+        mc.seed(value)
+        first = [x.sample() for _ in range(10)]
+
+        mc.seed(value)
+        assert [x.sample() for _ in range(10)] == first, f'seed({value}) not reproducible'
+
+
+def test_adjacent_seeds_give_unrelated_streams():
+    """Tests that the seed is scattered before it reaches the generator.
+
+    A seed goes through SplitMix64 on its way into the generator's four words
+    of state, which is what keeps seeds 1 and 2 from producing streams that
+    start out near each other.
+    """
+    x = mc.Normal(0.0, 1.0)
+
+    mc.seed(1)
+    one = np.array([x.sample() for _ in range(20_000)])
+
+    mc.seed(2)
+    two = np.array([x.sample() for _ in range(20_000)])
+
+    assert np.corrcoef(one, two)[0, 1] == pytest.approx(0.0, abs=0.03)
+
+
+def test_the_generator_is_uniform():
+    """Tests the draws behind every sample, through a digest of a flat line.
+
+    sample() is a quantile lookup at a uniform probability, so sampling a
+    digest fitted to an evenly spaced range reads that probability back out
+    almost unchanged. A generator with a bias, a short period or correlated
+    neighbours would show up here as a lumpy histogram or an autocorrelation.
+    """
+    mc.seed(31337)
+
+    flat = mc.Digest(maxBins=64)
+    flat.fit(np.linspace(0.0, 1.0, 200_001))
+
+    xs = np.array([flat.sample() for _ in range(500_000)])
+
+    assert xs.mean() == pytest.approx(0.5,      abs=0.005)
+    assert xs.var()  == pytest.approx(1.0/12.0, abs=0.005)
+
+    # Chi-square over 100 equal bins, 99 degrees of freedom: about 99 expected,
+    # and 150 is past the 0.1% point, so this fails on a real bias rather than
+    # on an unlucky run.
+    counts, _ = np.histogram(xs, bins=100, range=(0.0, 1.0))
+    expected  = len(xs) / 100.0
+    chiSquare = float(((counts - expected)**2 / expected).sum())
+
+    assert chiSquare < 150.0, f'chi-square {chiSquare} over 100 bins'
+
+    assert np.corrcoef(xs[:-1], xs[1:])[0, 1] == pytest.approx(0.0, abs=0.01)

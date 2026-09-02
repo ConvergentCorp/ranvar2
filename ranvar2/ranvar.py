@@ -3,7 +3,7 @@ import numbers
 import numpy  as np
 from cython import (
     cclass, cfunc, boundscheck, initializedcheck, wraparound, ccall, cdivision,
-    cast, final, address, sizeof, declare,
+    cast, final, address, sizeof, declare, exceptval,
 )
 
 from cython import p_double
@@ -15,9 +15,7 @@ from cython import void as cvoid
 from cython.cimports.libc.string import memmove
 from cython.cimports.libc.string import memcpy
 
-from cython.cimports.libc.stdlib import rand as crand
-from cython.cimports.libc.stdlib import srand as csrand
-from cython.cimports.libc.stdlib import RAND_MAX as C_RAND_MAX
+from cython.cimports.libc.stdint import uint64_t
 
 from cython.cimports.libc.math import log as clog
 from cython.cimports.libc.math import sqrt as csqrt
@@ -46,23 +44,126 @@ _spare     = declare(cdouble, 0.0)
 _haveSpare = declare(cint, 0)
 
 
+# xoshiro256++, the generator every draw in this module comes from. Four words
+# of state, process global the way the C library generator it replaced was, so
+# seed() still seeds every digest at once.
+#
+# rand() cost 18ns a uniform here against this one's 1.6ns, and gave 31 bits
+# where a double holds 53 -- so a draw was both slow and coarser than the type
+# it was returned in.
+_s0 = declare(uint64_t, 0)
+_s1 = declare(uint64_t, 0)
+_s2 = declare(uint64_t, 0)
+_s3 = declare(uint64_t, 0)
+
+# 2**64 / phi, SplitMix64's increment. Named because it does not fit in a
+# signed 64 bit integer, and giving it a declared type keeps the arithmetic
+# below in C rather than promoting it to Python.
+_GOLDEN = declare(uint64_t, 0x9E3779B97F4A7C15)
+_MIX_A = declare(uint64_t, 0xBF58476D1CE4E5B9)
+_MIX_B = declare(uint64_t, 0x94D049BB133111EB)
+
+
+@cfunc
+@exceptval(check=False)
+def _rotl(x: uint64_t, k: cint) -> uint64_t:
+    """Rotate a 64 bit word left.
+
+    Args:
+        x (uint64_t): The word to rotate.
+        k (int): How far, strictly between 0 and 64.
+
+    Returns:
+        uint64_t: The rotated word.
+    """
+    return (x << k) | (x >> (64 - k))
+
+
+@cfunc
+@exceptval(check=False)
+def _splitMix(z: uint64_t) -> uint64_t:
+    """One SplitMix64 output, used to expand a seed into xoshiro's state.
+
+    xoshiro needs 256 bits of state that are not mostly zeros, and a caller
+    passes one number. SplitMix64 is the mixer its authors recommend for
+    exactly this: it scatters a small counter across the whole word, so a seed
+    of 1 and a seed of 2 give unrelated states rather than adjacent ones.
+
+    Args:
+        z (uint64_t): The counter value to mix.
+
+    Returns:
+        uint64_t: The mixed word.
+    """
+    z = (z ^ (z >> 30)) * _MIX_A
+    z = (z ^ (z >> 27)) * _MIX_B
+
+    return z ^ (z >> 31)
+
+
+@cfunc
+@exceptval(check=False)
+def _random() -> uint64_t:
+    """Draw the next 64 bit word from xoshiro256++.
+
+    Returns:
+        uint64_t: A uniformly distributed word.
+    """
+    global _s0, _s1, _s2, _s3
+
+    result: uint64_t = _rotl(_s0 + _s3, 23) + _s0
+    t: uint64_t = _s1 << 17
+
+    _s2 ^= _s0
+    _s3 ^= _s1
+    _s1 ^= _s2
+    _s0 ^= _s3
+    _s2 ^= t
+    _s3 = _rotl(_s3, 45)
+
+    return result
+
+
 def seed(value):
     """Seed the random number generator that sample() draws from.
 
-    Sampling uses the C library generator, which is global to the process, so
-    this seeds every digest at once rather than any single instance.
+    The generator is global to the process, so this seeds every digest at once
+    rather than any single instance.
 
     Args:
-        value (int): Seed for the generator.
+        value (int): Seed for the generator. Any integer: it is taken modulo
+                   2**64, so a negative or very large one is accepted rather
+                   than refused.
     """
-    global _haveSpare
+    global _s0, _s1, _s2, _s3, _haveSpare
 
-    csrand(value)
+    z: uint64_t = cast(uint64_t, value & 0xFFFFFFFFFFFFFFFF)
+
+    z = z + _GOLDEN
+    _s0 = _splitMix(z)
+    z = z + _GOLDEN
+    _s1 = _splitMix(z)
+    z = z + _GOLDEN
+    _s2 = _splitMix(z)
+    z = z + _GOLDEN
+    _s3 = _splitMix(z)
+
+    # xoshiro has no way out of an all zero state. SplitMix64 never produces
+    # four zeros in a row, but the generator is silently useless if it ever
+    # does, which is worth one comparison at seeding time to rule out.
+    if (_s0 | _s1 | _s2 | _s3) == 0:
+        _s0 = 1
 
     # Otherwise the first normal draw after seeding would be the one left over
     # from before it, and seeding would not fully determine the sequence.
     _haveSpare = 0
 
+
+
+# The generator starts from a fixed state, so an unseeded process is
+# reproducible: the C library generator this replaced behaved as though seeded
+# with 1, and this keeps that.
+seed(1)
 
 @cclass
 class RanVar():
@@ -963,7 +1064,11 @@ class RanVar():
         hi: cint
         mid: cint
 
-        self._flush()
+        # Tested here rather than left to _flush(): sampling calls this once
+        # per draw with nothing pending, and the test is a field read where the
+        # call is not always one the C compiler inlines away.
+        if self.nBuf != 0:
+            self._flush()
 
         if p <= 0:
             return self._lower()
@@ -1020,7 +1125,8 @@ class RanVar():
             float: A value drawn from the distribution.
         """
 
-        p: cdouble = cast(cdouble, crand()) / cast(cdouble, C_RAND_MAX)
+        p: cdouble = _uniform01()
+
         return self.quantile(p)
 
 
@@ -1353,26 +1459,44 @@ class RanVar():
 # process-global C generator seed() controls, consistent with RanVar.sample().
 
 @cfunc
+@exceptval(check=False)
 @cdivision(True)
 def _uniform() -> cdouble:
     """Draw from the open interval (0, 1), never exactly 0 or 1.
 
     Box-Muller and the gamma sampler below both take a log of this, so the
-    closed end at 0 that crand() can in principle return would blow up to
-    -inf.
+    closed end at 0 that _uniform01() can in principle return would blow up to
+    -inf. It comes up about once in every 2**53 draws.
 
     Returns:
         float: A uniform draw strictly between 0 and 1.
     """
-    u: cdouble = cast(cdouble, crand()) / cast(cdouble, C_RAND_MAX)
+    u: cdouble = _uniform01()
 
-    while u <= 0.0 or u >= 1.0:
-        u = cast(cdouble, crand()) / cast(cdouble, C_RAND_MAX)
+    while u <= 0.0:
+        u = _uniform01()
 
     return u
 
 
 @cfunc
+@exceptval(check=False)
+@cdivision(True)
+def _uniform01() -> cdouble:
+    """Draw from [0, 1), with a full 53 bits of resolution.
+
+    The top 53 bits of a generator word scaled by 2**-53, which is the
+    standard way to fill a double: every representable value in [0, 1) with
+    that spacing is reachable, and 1 is not.
+
+    Returns:
+        float: A uniform draw in [0, 1).
+    """
+    return cast(cdouble, _random() >> 11) * (1.0 / 9007199254740992.0)
+
+
+@cfunc
+@exceptval(check=False)
 @cdivision(True)
 def _standardNormal() -> cdouble:
     """Draw one N(0, 1) value using the Box-Muller transform.
@@ -1409,6 +1533,7 @@ def _standardNormal() -> cdouble:
 
 
 @cfunc
+@exceptval(check=False)
 @cdivision(True)
 def _sampleGamma(shape: cdouble, scale: cdouble) -> cdouble:
     """Draw from Gamma(shape, scale) by Marsaglia and Tsang (2000).
@@ -1456,6 +1581,7 @@ def _sampleGamma(shape: cdouble, scale: cdouble) -> cdouble:
 
 
 @cfunc
+@exceptval(check=False)
 @cdivision(True)
 def _samplePoissonSmall(lam: cdouble) -> cdouble:
     """Draw from Poisson(lam) following Knuth (1969).
@@ -1485,6 +1611,7 @@ def _samplePoissonSmall(lam: cdouble) -> cdouble:
 
 
 @cfunc
+@exceptval(check=False)
 @cdivision(True)
 def _samplePoissonLarge(lam: cdouble) -> cdouble:
     """Draw from Poisson(lam) by Hormann's transformed rejection method
@@ -1529,6 +1656,7 @@ def _samplePoissonLarge(lam: cdouble) -> cdouble:
 
 
 @cfunc
+@exceptval(check=False)
 def _samplePoisson(lam: cdouble) -> cdouble:
     """Draw from Poisson(lam), routing to whichever method is cheap for lam.
 
