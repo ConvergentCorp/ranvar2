@@ -663,3 +663,47 @@ def test_all_public_ranvar_methods_are_present(cls, kwargs):
 
     for name in PUBLIC_METHODS:
         assert hasattr(instance, name), f'{cls.__name__} is missing {name}()'
+
+
+def test_normal_draws_are_independent_across_the_cached_pair():
+    """Tests that holding Box-Muller's second variate keeps the draws independent.
+
+    The transform yields two independent standard normals per pair of uniforms.
+    The second is kept rather than discarded, so consecutive draws come from
+    the same pair half the time -- which is only sound if the pair really is
+    independent. A sign or angle error here would show up as correlation
+    between neighbours while each draw on its own still looked normal.
+    """
+    mc.seed(31337)
+
+    xs = np.array([mc.Normal(0.0, 1.0).sample() for _ in range(200_000)])
+
+    assert xs.mean()        == pytest.approx(0.0, abs=0.02)
+    assert xs.std(ddof=1)   == pytest.approx(1.0, abs=0.02)
+
+    # Neighbours, and the two halves of each pair specifically.
+    assert np.corrcoef(xs[:-1], xs[1:])[0, 1]   == pytest.approx(0.0, abs=0.02)
+    assert np.corrcoef(xs[0::2], xs[1::2])[0, 1] == pytest.approx(0.0, abs=0.02)
+
+
+def test_seed_discards_a_held_normal_variate():
+    """Tests that seeding resets the normal stream, held spare included.
+
+    Box-Muller's spare outlives the call that produced it, so a seed that did
+    not clear it would hand the next draw a value from before the seed and an
+    odd number of draws would leave the stream offset.
+    """
+    x = mc.Normal(0.0, 1.0)
+
+    mc.seed(11)
+    first = [x.sample() for _ in range(20)]
+
+    mc.seed(11)
+    assert [x.sample() for _ in range(20)] == first
+
+    # An odd number of draws leaves a spare behind; seeding has to drop it.
+    mc.seed(11)
+    _ = [x.sample() for _ in range(7)]
+
+    mc.seed(11)
+    assert [x.sample() for _ in range(20)] == first

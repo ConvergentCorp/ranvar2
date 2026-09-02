@@ -3,7 +3,7 @@ import numbers
 import numpy  as np
 from cython import (
     cclass, cfunc, boundscheck, initializedcheck, wraparound, ccall, cdivision,
-    cast, final, address, sizeof,
+    cast, final, address, sizeof, declare,
 )
 
 from cython import p_double
@@ -21,6 +21,7 @@ from cython.cimports.libc.stdlib import RAND_MAX as C_RAND_MAX
 from cython.cimports.libc.math import log as clog
 from cython.cimports.libc.math import sqrt as csqrt
 from cython.cimports.libc.math import cos as ccos
+from cython.cimports.libc.math import sin as csin
 from cython.cimports.libc.math import exp as cexp
 from cython.cimports.libc.math import floor as cfloor
 from cython.cimports.libc.math import fabs as cfabs
@@ -32,6 +33,18 @@ from cython.cimports.libc.math import M_PI
 from cython.cimports.libc.math import M_SQRT2
 
 
+# Box-Muller turns one pair of uniforms into two independent standard normal
+# variates, and _standardNormal() used to compute both and return one. The
+# spare is kept here instead, so every second draw is a load rather than a log,
+# a square root and a pair of trig calls. Module level, like the generator it
+# comes from, and cleared by seed() so that seeding still resets the stream.
+# declare() rather than an annotation: a module level annotation in pure Python
+# mode leaves the name a Python global, so every draw would go through a dict
+# lookup and a box. These are C variables.
+_spare     = declare(cdouble, 0.0)
+_haveSpare = declare(cint, 0)
+
+
 def seed(value):
     """Seed the random number generator that sample() draws from.
 
@@ -41,7 +54,13 @@ def seed(value):
     Args:
         value (int): Seed for the generator.
     """
+    global _haveSpare
+
     csrand(value)
+
+    # Otherwise the first normal draw after seeding would be the one left over
+    # from before it, and seeding would not fully determine the sequence.
+    _haveSpare = 0
 
 
 @cclass
@@ -1129,13 +1148,35 @@ def _uniform() -> cdouble:
 def _standardNormal() -> cdouble:
     """Draw one N(0, 1) value using the Box-Muller transform.
 
+    The transform yields two independent variates per pair of uniforms, at the
+    cost of one logarithm, one square root and one pair of trig calls. The
+    second is held rather than discarded, so alternate calls cost a load.
+
     Returns:
         float: A value drawn from the standard normal distribution.
     """
-    u1: cdouble = _uniform()
-    u2: cdouble = _uniform()
+    global _spare, _haveSpare
 
-    return csqrt(-2.0 * clog(u1)) * ccos(2.0 * M_PI * u2)
+    u1: cdouble
+    u2: cdouble
+    r: cdouble
+    theta: cdouble
+
+    if _haveSpare:
+        _haveSpare = 0
+
+        return _spare
+
+    u1 = _uniform()
+    u2 = _uniform()
+
+    r     = csqrt(-2.0 * clog(u1))
+    theta = 2.0 * M_PI * u2
+
+    _spare     = r * csin(theta)
+    _haveSpare = 1
+
+    return r * ccos(theta)
 
 
 @cfunc
