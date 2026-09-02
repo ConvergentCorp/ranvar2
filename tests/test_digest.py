@@ -2,6 +2,7 @@ import ranvar2 as mc
 import numpy as np
 import pickle
 import copy
+import pytest
 
 
 def test_nActiveCount():
@@ -460,3 +461,45 @@ def test_ladder_is_rebuilt_after_pickle_and_copy():
     for y in [pickle.loads(pickle.dumps(x)), copy.deepcopy(x)]:
         for p in [0.01, 0.1, 0.5, 0.9, 0.99]:
             assert y.quantile(p) == x.quantile(p), f'restored digest differs at p={p}'
+
+
+def test_maxbins_below_three_is_refused():
+    """Tests that a digest too small to merge is refused at construction.
+
+    Once full a digest holds maxBins + 1 centroids, and the merge step keeps
+    the first and last for the tails, so it needs an interior pair left to
+    merge. Below three bins _findMinimumDifference() scans an empty range and
+    returns its -1 sentinel, which _add() would then use as an index -- one
+    slot before the arrays, with bounds checking off.
+    """
+    for maxBins in [-1, 0, 1, 2]:
+        with pytest.raises(ValueError, match='at least 3'):
+            mc.Digest(maxBins=maxBins)
+
+    # Three is the smallest that can merge, and has to keep working.
+    x = mc.Digest(maxBins=3)
+    for d in [5.0, 1.0, 9.0, 3.0, 7.0, 2.0]:
+        x.add(d)
+
+    assert x.getActiveBinCount() == 3
+    assert x.lower() == 1.0
+    assert x.upper() == 9.0
+    assert sum(x.getWeights()) == 6
+
+
+def test_maxbins_bound_is_enforced_for_every_subclass():
+    """Tests that the parametric subclasses validate maxBins as well.
+
+    They pass it through to RanVar and never build a digest with it, but they
+    would hand the same corrupting value on to anything that later did.
+    """
+    for build in [
+        lambda n: mc.Digest(maxBins=n),
+        lambda n: mc.Normal(mean=0.0, std=1.0, maxBins=n),
+        lambda n: mc.NegBinom(mean=1.0, dispersion=1.0, maxBins=n),
+        lambda n: mc.Constant(value=1.0, maxBins=n),
+    ]:
+        with pytest.raises(ValueError, match='at least 3'):
+            build(2)
+
+        assert build(3) is not None

@@ -92,8 +92,23 @@ class RanVar():
 
         Args:
             maxBins (int, optional): Maximum number of centroids to maintain.
-                                   Defaults to 32.
+                                   Must be at least 3. Defaults to 32.
+
+        Raises:
+            ValueError: If maxBins is less than 3.
         """
+        # The merge step reserves the first and last centroid for the tails, so
+        # it needs an interior pair left to merge. An overflowing digest holds
+        # maxBins + 1 centroids, which leaves _findMinimumDifference() an empty
+        # range to scan below three bins: it would return its -1 sentinel and
+        # _add() would index one slot before the arrays.
+        if maxBins < 3:
+            raise ValueError(
+                f'maxBins must be at least 3, got {maxBins}: a digest needs an '
+                f'interior pair to merge once it is full, on top of the first '
+                f'and last centroid it keeps for the tails'
+            )
+
         self.maxBins = maxBins
         self.nActive = 0
 
@@ -171,6 +186,11 @@ class RanVar():
         This method is used when the digest exceeds maxBins to identify which
         centroids should be merged. It avoids merging the first and last centroids
         to preserve the tails of the distribution.
+
+        _add() calls this only on an overflowing digest, where nActive is
+        maxBins + 1, and __init__ refuses a maxBins below 3. The scanned range is
+        therefore never empty and the -1 below is unreachable, which is what lets
+        _add() use the result as an index without checking it.
 
         Returns:
             int: Index of the first centroid in the pair with minimum distance,
