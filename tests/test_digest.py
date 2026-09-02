@@ -728,3 +728,72 @@ def test_weighted_points_are_merged_by_weight():
     # The weighted mean is exact through a merge: it is the one thing merging
     # two centroids into their weighted average preserves.
     assert x.mean() == pytest.approx((1*2 + 5*3 + 3*1.5 + 2*0.5) / 7.0)
+
+
+def test_both_quantile_search_paths_agree():
+    """Tests that the guide table answers exactly as the bisection does.
+
+    quantile() bisects the weight ladder the first time a ladder is read and
+    builds a lookup table if it is read again, since the table costs a pass to
+    build and only pays for itself across repeated reads. Both paths have to
+    give the same answer to the last bit, so this reads each p through the
+    first path and then through the second.
+    """
+    np.random.seed(31337)
+
+    for maxBins in [3, 8, 32, 128]:
+        for n in [1, 2, 5, 100, 20_000]:
+            data = np.random.randn(n)*17 + 3
+
+            ps = list(np.linspace(0.0, 1.0, 257)) + [1e-15, 1.0 - 1e-15]
+
+            # A fresh digest per p: each read is the first read of its ladder,
+            # so each takes the bisection.
+            bisected = []
+            for p in ps:
+                x = mc.Digest(maxBins=maxBins)
+                x.fit(data)
+                bisected.append(x.quantile(float(p)))
+
+            # One digest read repeatedly, so every read after the first takes
+            # the table.
+            y = mc.Digest(maxBins=maxBins)
+            y.fit(data)
+            y.quantile(0.5)
+
+            for p, want in zip(ps, bisected):
+                assert y.quantile(float(p)) == want, \
+                    f'maxBins={maxBins}, n={n}, p={p}'
+
+
+def test_the_guide_table_is_rebuilt_after_points_arrive():
+    """Tests that the lookup table is dropped when the ladder under it changes.
+
+    The table indexes the ladder, so it is as stale as the ladder is: one kept
+    across an add would send a query to a segment of the digest as it used to
+    be. The first read after a change bisects and the next uses the table, so
+    reading the same p twice takes both paths -- and a table that had survived
+    the change would answer the second differently from the first.
+    """
+    np.random.seed(31337)
+    data = np.random.randn(2_000)*10 + 50
+
+    for p in [0.05, 0.25, 0.5, 0.75, 0.95, 0.99]:
+        x = mc.Digest(maxBins=32)
+        x.fit(data)
+
+        # Two reads, so the table is built and in use.
+        x.quantile(0.5)
+        x.quantile(0.5)
+
+        for _ in range(500):
+            x.add(500.0)
+
+        bisected = x.quantile(p)   # first read after the change
+        tabled   = x.quantile(p)   # and the one that uses the rebuilt table
+
+        assert bisected == tabled, f'stale guide at p={p}'
+
+        # And the answer has to know about the points that arrived.
+        assert x.upper() == 500.0
+        assert x.quantile(0.99) > np.percentile(data, 99)

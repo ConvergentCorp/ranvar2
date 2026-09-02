@@ -6,6 +6,8 @@ from cython import (
     cast, final, address, sizeof, declare, exceptval,
 )
 
+from cython import p_int
+
 from cython import p_double
 
 from cython import double as cdouble
@@ -236,11 +238,15 @@ class RanVar():
     # The quantile each of the maxBins buckets closes at. See _allocate().
     _bnds: cdouble[::1]
 
+    # p -> starting segment, so a lookup replaces the bisection. See _rebuildLadder.
+    _guide: cint[::1]
+
     buf: np.ndarray
     bufw: np.ndarray
     tb: np.ndarray
     tc: np.ndarray
     bnds: np.ndarray
+    guide: np.ndarray
 
     maxBins: cint
     nActive: cint
@@ -255,6 +261,10 @@ class RanVar():
 
     # Whether the four buffers above have been allocated yet. See _allocate().
     _ready: cint
+
+    # How far the guide table has got for the current ladder: 0 not asked for,
+    # 1 asked once, 2 built. See quantile().
+    _guideReady: cint
 
     def __init__(self, maxBins=32):
         """Initialize a new t-digest.
@@ -303,10 +313,12 @@ class RanVar():
         self.tb   = None
         self.tc   = None
         self.bnds = None
+        self.guide = None
 
         self._total = 0
         self._stale = 1
         self._ready = 0
+        self._guideReady = 0
 
     @cfunc
     @final
@@ -346,6 +358,8 @@ class RanVar():
         self.bnds = (np.sin(-np.pi/2 + steps * np.pi / self.maxBins) + 1.0) * 0.5
         self.bnds[self.maxBins - 1] = 1.0
 
+        self.guide = np.zeros(self.maxBins * 4, dtype=np.int32)
+
         self._bins = self.bins
         self._cnts = self.cnts
         self._cumw = self.cumw
@@ -356,6 +370,7 @@ class RanVar():
         self._tb   = self.tb
         self._tc   = self.tc
         self._bnds = self.bnds
+        self._guide = self.guide
 
         self._ready = 1
 
@@ -820,7 +835,50 @@ class RanVar():
             som = som + wGap
             cumw[i+1] = som
 
+        # A table from the top of p straight to a segment, so a draw does a
+        # multiply and a load where it used to bisect the ladder. Entry j holds
+        # the last segment starting at or below j/G of the total, and the walk
+        # below it covers the rest -- under one step on average at G = 4 per bin.
         self._stale = 0
+        self._guideReady = 0
+
+    @cfunc
+    @final
+    @boundscheck(False)
+    @wraparound(False)
+    @cdivision(True)
+    @initializedcheck(False)
+    def _buildGuide(self) -> cvoid:
+        """Build the table that takes quantile() straight to a segment.
+
+        Entry j holds the last segment starting at or below j/G of the total
+        weight, so a query lands within a step or two of its answer instead of
+        bisecting the ladder. G is four slots per bin, which keeps the walk
+        after the lookup under one step on average.
+
+        Costs a pass of G to build and saves a bisection per query, so it is
+        only worth it once a ladder is read more than once -- which is why
+        quantile() waits for a second query before asking for it, rather than
+        building it here where the ladder is.
+        """
+        cumw: p_double = address(self._cumw[0])
+        guide: p_int = address(self._guide[0])
+
+        g: cint = self._guide.shape[0]
+        seg: cint = 0
+        j: cint
+        edge: cdouble
+        step: cdouble = self._total / cast(cdouble, g)
+
+        for j in range(g):
+            edge = cast(cdouble, j) * step
+
+            while (seg < self.nActive - 2) and (cumw[seg + 1] <= edge):
+                seg = seg + 1
+
+            guide[j] = seg
+
+        self._guideReady = 2
 
     # Public API. --------------------------------------------------------------
 
@@ -1063,6 +1121,8 @@ class RanVar():
         lo: cint
         hi: cint
         mid: cint
+        g: cint
+        slot: cint
 
         # Tested here rather than left to _flush(): sampling calls this once
         # per draw with nothing pending, and the test is a field read where the
@@ -1078,8 +1138,13 @@ class RanVar():
         if self._stale:
             self._rebuildLadder()
 
-        c   = self._bins
-        cum = self._cumw
+        # Plain pointers, not memoryview locals. Binding a memoryview to a
+        # local takes an acquisition count on it -- an atomic increment on the
+        # way in and a matching release on the way out, four of them per call
+        # -- which sampling pays once per draw for two arrays it only reads.
+        c: p_double   = address(self._bins[0])
+        cum: p_double = address(self._cumw[0])
+        gap: p_double = address(self._gaps[0])
 
         W  = self._total
         w_ = p*W
@@ -1088,23 +1153,44 @@ class RanVar():
         # one starting at or below it. Searching for the last rather than the
         # first also steps over any segment of zero weight, which has no
         # interior to interpolate across.
-        lo = 0
-        hi = self.nActive - 1
+        # A ladder read once -- a digest being queried between adds -- is not
+        # worth a table pass to search. One read once, and every read after it,
+        # is: that is sampling, which is what this is here for.
+        if self._guideReady == 1:
+            self._buildGuide()
 
-        while lo < hi:
-            mid = (lo + hi + 1) // 2
+        if self._guideReady == 2:
+            g = self._guide.shape[0]
+            slot = cast(cint, p * cast(cdouble, g))
 
-            if cum[mid] <= w_:
-                lo = mid
-            else:
-                hi = mid - 1
+            if slot >= g:
+                slot = g - 1
+
+            lo = address(self._guide[0])[slot]
+            hi = self.nActive - 2
+
+            while (lo < hi) and (cum[lo + 1] <= w_):
+                lo = lo + 1
+        else:
+            self._guideReady = 1
+
+            lo = 0
+            hi = self.nActive - 1
+
+            while lo < hi:
+                mid = (lo + hi + 1) // 2
+
+                if cum[mid] <= w_:
+                    lo = mid
+                else:
+                    hi = mid - 1
 
         # Past the last segment: one centroid only, or p*W rounded up to the
         # total. Either way the answer is the top of the support.
         if lo > self.nActive - 2:
             return self._upper()
 
-        fraction = (w_ - cum[lo]) / self._gaps[lo]
+        fraction = (w_ - cum[lo]) / gap[lo]
 
         return fraction * (c[lo+1] - c[lo]) + c[lo]
 
@@ -1432,6 +1518,8 @@ class RanVar():
         self.bnds = (np.sin(-np.pi/2 + steps * np.pi / self.maxBins) + 1.0) * 0.5
         self.bnds[self.maxBins - 1] = 1.0
 
+        self.guide = np.zeros(self.maxBins * 4, dtype=np.int32)
+
         self._bins = self.bins
         self._cnts = self.cnts
         self._cumw = self.cumw
@@ -1442,6 +1530,7 @@ class RanVar():
         self._tb   = self.tb
         self._tc   = self.tc
         self._bnds = self.bnds
+        self._guide = self.guide
 
         self._ready = 1
 

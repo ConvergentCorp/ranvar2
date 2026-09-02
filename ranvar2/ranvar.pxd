@@ -33,6 +33,7 @@ cdef class RanVar:
     cdef double[::1] _tb
     cdef double[::1] _tc
     cdef double[::1] _bnds
+    cdef int[::1] _guide
 
     cdef object bins
     cdef object cnts
@@ -44,6 +45,7 @@ cdef class RanVar:
     cdef object tb
     cdef object tc
     cdef object bnds
+    cdef object guide
 
     cdef int maxBins
     cdef int nActive
@@ -54,6 +56,7 @@ cdef class RanVar:
     cdef double _total
     cdef int _stale
     cdef int _ready
+    cdef int _guideReady
 
     @cython.final
     cdef void _allocate(self)
@@ -81,6 +84,8 @@ cdef class RanVar:
                                    double *yi, double *yi_n)
     @cython.final
     cdef void _rebuildLadder(self)
+    @cython.final
+    cdef void _buildGuide(self)
 
     cpdef double quantile(self, double p)
     cpdef double sample(self)
