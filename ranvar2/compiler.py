@@ -4,6 +4,7 @@ import hashlib
 import importlib.machinery
 import importlib.util
 import inspect
+import json
 import os
 import shutil
 import subprocess
@@ -710,21 +711,49 @@ def isRanVarArray(annotation):
 
 # Building. --------------------------------------------------------------------
 
+def optimiseFlags():
+    """Compiler flags a generated model is built with.
+
+    setuptools otherwise hands the model Python's own CFLAGS, which stop at
+    -O2. These are the same flags setup.py builds ranvar2.ranvar itself with,
+    so a model is optimised to the same level as the digest it calls into.
+
+    -march=native is opt-in for the same reason it is in setup.py: it bakes in
+    the build machine's instruction set. A generated model is cached under
+    ~/.cache/ranvar2 and reused by later processes, so the flags are part of
+    the cache key -- changing them rebuilds rather than reusing a module built
+    with the old ones.
+
+    Returns:
+        list: Flags to pass as extra_compile_args.
+    """
+    if sys.platform == 'win32':
+        return ['/O2']
+
+    flags = ['-O3', '-fno-math-errno']
+
+    if os.environ.get('RANVAR2_NATIVE'):
+        flags.append('-march=native')
+
+    return flags
+
+
 # Run in a subprocess so a build failure cannot leave setuptools' global state
 # behind in the interpreter that asked for it.
 BUILD = '''
+import json
 import os
 import sys
 
 from setuptools import Extension, setup
 from Cython.Build import cythonize
 
-name, source, target, include = sys.argv[1:5]
+name, source, target, include, flags = sys.argv[1:6]
 
 setup(
     name=name,
     ext_modules=cythonize(
-        [Extension(name, [source])],
+        [Extension(name, [source], extra_compile_args=json.loads(flags))],
         include_path=[include],
         quiet=True,
         language_level=3,
@@ -770,9 +799,10 @@ def includeDir():
 def cacheKey(source):
     """Build the name a generated module is cached under.
 
-    Keyed on the generated source, the interpreter and the compiled RanVar the
-    module links against, so rebuilding ranvar2 does not leave a stale module
-    behind that was built against a different layout.
+    Keyed on the generated source, the interpreter, the compiled RanVar the
+    module links against and the flags it is built with, so neither rebuilding
+    ranvar2 nor changing the optimisation level leaves a stale module behind
+    that was built against a different layout.
 
     Args:
         source (str): The generated module source.
@@ -786,6 +816,7 @@ def cacheKey(source):
     digest.update(source.encode('utf-8'))
     digest.update(sys.version.encode('utf-8'))
     digest.update(importlib.machinery.EXTENSION_SUFFIXES[0].encode('utf-8'))
+    digest.update(repr(optimiseFlags()).encode('utf-8'))
 
     status = os.stat(compiled.__file__)
     digest.update(f'{compiled.__file__}:{status.st_mtime_ns}:{status.st_size}'.encode('utf-8'))
@@ -829,7 +860,10 @@ def build(source, key):
                 handle.write(source)
 
             result = subprocess.run(
-                [sys.executable, '-c', BUILD, name, module, work, includeDir()],
+                [
+                    sys.executable, '-c', BUILD, name, module, work,
+                    includeDir(), json.dumps(optimiseFlags()),
+                ],
                 capture_output=True,
                 text=True,
                 cwd=work,

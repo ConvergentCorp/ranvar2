@@ -1,11 +1,18 @@
 import numbers
 
 import numpy  as np
-from cython import cclass, cfunc, boundscheck, initializedcheck, wraparound, ccall, cdivision, cast
+from cython import (
+    cclass, cfunc, boundscheck, initializedcheck, wraparound, ccall, cdivision,
+    cast, final, address, sizeof,
+)
+
+from cython import p_double
 
 from cython import double as cdouble
 from cython import int as cint
 from cython import void as cvoid
+
+from cython.cimports.libc.string import memmove
 
 from cython.cimports.libc.stdlib import rand as crand
 from cython.cimports.libc.stdlib import srand as csrand
@@ -69,10 +76,10 @@ class RanVar():
         >>> digest.quantile(0.5)  # Median
         3.0
     """    
-    _bins: cdouble[:]
-    _cnts: cdouble[:]
-    _cumw: cdouble[:]
-    _gaps: cdouble[:]
+    _bins: cdouble[::1]
+    _cnts: cdouble[::1]
+    _cumw: cdouble[::1]
+    _gaps: cdouble[::1]
 
     bins: np.ndarray
     cnts: np.ndarray
@@ -125,72 +132,99 @@ class RanVar():
         self._total = 0
         self._stale = 1
 
-    @ccall
+    @cfunc
+    @final
     @boundscheck(False)
     @wraparound(False)
     @initializedcheck(False)
-    def _findLastLesserOrEqualIndex(self, point: cdouble) -> cint:
+    def _findLastLesserOrEqualIndex(self, bins: p_double, n: cint, point: cdouble) -> cint:
         """Find the index of the last centroid that is <= the given point.
 
-        This method performs a linear search through the sorted centroids to find
-        the insertion point for a new value.
+        The centroids are sorted, so this bisects rather than walking them: the
+        scan this replaced cost on the order of maxBins probes per point, and
+        the insert is one of three passes over the array that _add() already
+        makes.
 
         Args:
+            bins (double*): The centroid values, ascending.
+            n (int): How many of them are live.
             point (float): The value to search for.
 
         Returns:
             int: Index of the last centroid <= point, or -1 if point is smaller
                 than all centroids.
         """
-        idx: cint = -1
-        while True:
-            if (self._bins[idx + 1] > point) or (idx + 1 == self.nActive):
-                break
+        lo: cint = 0
+        hi: cint = n
+        mid: cint
+
+        # Settles on the first centroid strictly greater than point, so the one
+        # before it is the last that is not. Landing after a run of equal
+        # centroids rather than before it is what the walk did too.
+        while lo < hi:
+            mid = (lo + hi) >> 1
+
+            if bins[mid] <= point:
+                lo = mid + 1
             else:
-                idx += 1
+                hi = mid
 
-        return idx
+        return lo - 1
 
-    @ccall
+    @cfunc
+    @final
     @boundscheck(False)
     @wraparound(False)
     @initializedcheck(False)
-    def _shiftRightAndInsert(self, idx:cint, point:cdouble, count:cdouble) -> cvoid:
+    def _shiftRightAndInsert(self, bins: p_double, cnts: p_double, idx: cint,
+                             point: cdouble, count: cdouble) -> cvoid:
         """Insert a new centroid at the specified position by shifting elements right.
 
         This method maintains the sorted order of centroids by shifting all centroids
         to the right of the insertion point and inserting the new centroid.
 
+        The shift goes through memmove rather than an element loop: it is a
+        contiguous block move, which memmove does word at a time.
+
         Args:
+            bins (double*): The centroid values.
+            cnts (double*): The centroid weights, aligned with bins.
             idx (int): Index after which to insert the new centroid.
             point (float): Value of the new centroid.
             count (float): Weight of the new centroid.
         """
-        j: cint
+        n: cint = self.nActive
+        moved: cint = n - 1 - idx
 
-        for j in range(self.nActive - 1, idx, -1):
-            self._bins[j+1] = self._bins[j]
-            self._cnts[j+1] = self._cnts[j]
+        if moved > 0:
+            memmove(address(bins[idx+2]), address(bins[idx+1]), moved * sizeof(cdouble))
+            memmove(address(cnts[idx+2]), address(cnts[idx+1]), moved * sizeof(cdouble))
 
-        self._bins[idx+1] = point
-        self._cnts[idx+1] = count
-        self.nActive += 1
+        bins[idx+1] = point
+        cnts[idx+1] = count
+
+        self.nActive = n + 1
 
     @cfunc
+    @final
     @boundscheck(False)
     @wraparound(False)
     @initializedcheck(False)
-    def _findMinimumDifference(self) -> cint:
+    def _findMinimumDifference(self, bins: p_double, n: cint) -> cint:
         """Find the pair of adjacent centroids with minimum distance.
 
         This method is used when the digest exceeds maxBins to identify which
         centroids should be merged. It avoids merging the first and last centroids
         to preserve the tails of the distribution.
 
-        _add() calls this only on an overflowing digest, where nActive is
-        maxBins + 1, and __init__ refuses a maxBins below 3. The scanned range is
-        therefore never empty and the -1 below is unreachable, which is what lets
-        _add() use the result as an index without checking it.
+        _add() calls this only on an overflowing digest, where n is maxBins + 1,
+        and __init__ refuses a maxBins below 3. The scanned range is therefore
+        never empty and the -1 below is unreachable, which is what lets _add()
+        use the result as an index without checking it.
+
+        Args:
+            bins (double*): The centroid values, ascending.
+            n (int): How many of them are live.
 
         Returns:
             int: Index of the first centroid in the pair with minimum distance,
@@ -206,38 +240,43 @@ class RanVar():
         # We don't want to merge the first or last bin because we want to maintain the
         # tails. It also solves the problem where we try and sample a point that is before
         # the first centroid.
-        for k in range(1, self.nActive - 2):
-            dB = self._bins[k+1] - self._bins[k]
+        for k in range(1, n - 2):
+            dB = bins[k+1] - bins[k]
             if dB < minDiff:
                 minDiff = dB
                 minK    = k
 
         return minK
 
-    @ccall
+    @cfunc
+    @final
     @boundscheck(False)
     @wraparound(False)
     @initializedcheck(False)
-    def _shiftLeftAndOverride(self, idx: cint) -> cvoid:
+    def _shiftLeftAndOverride(self, bins: p_double, cnts: p_double, idx: cint) -> cvoid:
         """Remove a centroid by shifting all subsequent centroids left.
 
         This method maintains the sorted order and compactness of the centroid
         arrays by removing the centroid at the specified index.
 
         Args:
+            bins (double*): The centroid values.
+            cnts (double*): The centroid weights, aligned with bins.
             idx (int): Index of the centroid to remove.
         """
-        j: cint
-        for j in range(idx, self.nActive-1):
-            self._bins[j] = self._bins[j+1]
-            self._cnts[j] = self._cnts[j+1]
+        n: cint = self.nActive
+        moved: cint = n - 1 - idx
 
-        self._bins[self.nActive-1] = 0
-        self._cnts[self.nActive-1] = 0
+        if moved > 0:
+            memmove(address(bins[idx]), address(bins[idx+1]), moved * sizeof(cdouble))
+            memmove(address(cnts[idx]), address(cnts[idx+1]), moved * sizeof(cdouble))
 
-        self.nActive -= 1
+        bins[n-1] = 0
+        cnts[n-1] = 0
 
-    @ccall
+        self.nActive = n - 1
+
+    @cfunc
     @boundscheck(False)
     @wraparound(False)
     @cdivision(True)
@@ -250,33 +289,45 @@ class RanVar():
         centroid. If the number of centroids exceeds maxBins, it merges the two
         closest centroids.
 
+        The two buffers are taken as plain pointers once, up front, and passed
+        down rather than reached through self each time. A store through one
+        memoryview may alias the other's descriptor as far as the C compiler
+        can tell, so it has to reload .data after every write it cannot rule
+        that out for; it can keep a local pointer in a register instead. That
+        reload was most of what this method spent on array access.
+
         Args:
             point (float): The value to add.
             count (float): The weight/count of the value.
         """
+        bins: p_double = address(self._bins[0])
+        cnts: p_double = address(self._cnts[0])
 
-        idx:cint = self._findLastLesserOrEqualIndex(point)
+        idx:cint = self._findLastLesserOrEqualIndex(bins, self.nActive, point)
 
-        if (idx >= 0) and self._bins[idx] == point:
-            self._cnts[idx] += count
+        if (idx >= 0) and bins[idx] == point:
+            cnts[idx] += count
         else:
-            self._shiftRightAndInsert(idx, point, count)
+            self._shiftRightAndInsert(bins, cnts, idx, point, count)
 
         if self.nActive > self.maxBins:
-            k:cint = self._findMinimumDifference()
+            k:cint = self._findMinimumDifference(bins, self.nActive)
 
-            sumC:cdouble = self._cnts[k+1] + self._cnts[k]
+            sumC:cdouble = cnts[k+1] + cnts[k]
 
-            self._bins[k] = (self._bins[k]*self._cnts[k] + self._bins[k+1]*self._cnts[k+1])
-            self._bins[k] = self._bins[k] / sumC
-            self._cnts[k] = sumC
+            # Left as two statements: rounding the weighted sum to a double
+            # before dividing is what the merged centroid has always been.
+            bins[k] = (bins[k]*cnts[k] + bins[k+1]*cnts[k+1])
+            bins[k] = bins[k] / sumC
+            cnts[k] = sumC
 
-            self._shiftLeftAndOverride(k+1)
+            self._shiftLeftAndOverride(bins, cnts, k+1)
 
         self._stale = 1
 
 
-    @ccall
+    @cfunc
+    @final
     @boundscheck(False)
     @cdivision(True)
     @wraparound(False)
@@ -295,7 +346,8 @@ class RanVar():
 
         return self._bins[0]
 
-    @ccall
+    @cfunc
+    @final
     @boundscheck(False)
     @cdivision(True)
     @wraparound(False)
@@ -317,6 +369,7 @@ class RanVar():
         return self._bins[self.nActive - 1]
 
     @cfunc
+    @final
     @boundscheck(False)
     @wraparound(False)
     @initializedcheck(False)
@@ -335,6 +388,7 @@ class RanVar():
         return som    
     
     @cfunc
+    @final
     @boundscheck(False)
     @wraparound(False)
     @cdivision(True)
@@ -378,6 +432,7 @@ class RanVar():
         return yi, yi_n
 
     @cfunc
+    @final
     @boundscheck(False)
     @wraparound(False)
     @cdivision(True)

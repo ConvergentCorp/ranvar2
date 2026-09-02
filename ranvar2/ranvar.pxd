@@ -7,12 +7,26 @@
 # Cython requires every C method of the class to be declared here once the file
 # exists, so a new @ccall or @cfunc method in ranvar.py has to be added below as
 # well or the build fails.
+#
+# The buffers are declared contiguous ([::1], not [:]). They are numpy arrays
+# allocated whole, so they always are, and saying so lets Cython index them by
+# offset rather than loading and multiplying a stride on every single access --
+# which also lets the C compiler vectorise the shift loops in _add().
+#
+# Most of the internal methods are declared final. None of them is overridden
+# anywhere, and final keeps them out of the vtable, so the C compiler can inline
+# them into _add() instead of making an indirect call it cannot see through.
+# _add() itself is deliberately NOT final: ranvar2.compiler's generated modules
+# cimport RanVar and call it once per sample, which needs it in the vtable.
+
+cimport cython
+
 
 cdef class RanVar:
-    cdef double[:] _bins
-    cdef double[:] _cnts
-    cdef double[:] _cumw
-    cdef double[:] _gaps
+    cdef double[::1] _bins
+    cdef double[::1] _cnts
+    cdef double[::1] _cumw
+    cdef double[::1] _gaps
 
     cdef object bins
     cdef object cnts
@@ -25,16 +39,29 @@ cdef class RanVar:
     cdef double _total
     cdef int _stale
 
-    cpdef int _findLastLesserOrEqualIndex(self, double point)
-    cpdef void _shiftRightAndInsert(self, int idx, double point, double count)
-    cdef int _findMinimumDifference(self)
-    cpdef void _shiftLeftAndOverride(self, int idx)
-    cpdef void _add(self, double point, double count)
-    cpdef double _lower(self)
-    cpdef double _upper(self)
+    @cython.final
+    cdef int _findLastLesserOrEqualIndex(self, double *bins, int n, double point)
+    @cython.final
+    cdef void _shiftRightAndInsert(self, double *bins, double *cnts, int idx,
+                                   double point, double count)
+    @cython.final
+    cdef int _findMinimumDifference(self, double *bins, int n)
+    @cython.final
+    cdef void _shiftLeftAndOverride(self, double *bins, double *cnts, int idx)
+
+    cdef void _add(self, double point, double count)
+
+    @cython.final
+    cdef double _lower(self)
+    @cython.final
+    cdef double _upper(self)
+    @cython.final
     cdef double _sumWeights(self)
+    @cython.final
     cdef _interpolationBounds(self, int i, double som)
+    @cython.final
     cdef void _rebuildLadder(self)
+
     cpdef double quantile(self, double p)
     cpdef double sample(self)
 

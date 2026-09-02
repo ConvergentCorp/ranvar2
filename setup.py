@@ -31,21 +31,31 @@
 # setup(**setup_kwargs)
 
 
+import os
+import sys
+
 import numpy as np
 from Cython.Build import cythonize
 from setuptools import Extension, setup
 
+# Python's own CFLAGS stop at -O2. -O3 is worth 11-16% here, almost all of it in
+# _add()'s shift loops, which only vectorise now that the buffers are declared
+# contiguous. -fno-math-errno lets the C compiler treat sqrt/log/exp as pure,
+# which it needs to hoist them out of the sampling loops.
+#
+# -march=native is deliberately opt-in: it bakes in the build machine's
+# instruction set, which is right for a local build and wrong for any wheel that
+# leaves it. Set RANVAR2_NATIVE=1 to enable it.
+if sys.platform == 'win32':
+    OPTIMISE = ['/O2']
+else:
+    OPTIMISE = ['-O3', '-fno-math-errno']
+
+    if os.environ.get('RANVAR2_NATIVE'):
+        OPTIMISE.append('-march=native')
+
 extensions = [
-    Extension("ranvar2.ranvar", ["ranvar2/ranvar.py"]),
-    # Extension("ranvar2.vm", ["ranvar2/vm.py"]),
-    # Extension("ranvar2.digest", ["ranvar2/digest.py"], include_dirs=[np.get_include()]),
-    # Extension(
-    #     "ranvar2.cdigest",
-    #     sources=["ranvar2/cdigest.pyx"],
-    #     include_dirs=[np.get_include(), "ranvar2/cpp"],
-    #     language="c++",
-    #     extra_compile_args=["-std=c++17"],
-    # ),
+    Extension("ranvar2.ranvar", ["ranvar2/ranvar.py"], extra_compile_args=OPTIMISE),
 ]
 
 setup(
@@ -53,7 +63,6 @@ setup(
     ext_modules=cythonize(
         extensions,
         include_path=["ranvar2/", np.get_include()],
-        force=True,
-        annotate=True,
+        language_level=3,
     ),
 )
