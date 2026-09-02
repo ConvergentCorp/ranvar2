@@ -503,3 +503,125 @@ def test_maxbins_bound_is_enforced_for_every_subclass():
             build(2)
 
         assert build(3) is not None
+
+
+def test_fit_agrees_across_input_types():
+    """Tests that the typed bulk path fits a numpy array exactly as iterating it did.
+
+    fit() hands a contiguous numeric array straight to a C loop rather than
+    iterating it in Python. That has to be an optimisation only: every input
+    shape has to produce the same centroids, to the last bit.
+    """
+    values = [float(v) for v in range(1000)]
+
+    reference = mc.Digest(maxBins=32)
+    reference.fit(values)
+
+    sources = [
+        values,
+        tuple(values),
+        (v for v in values),
+        iter(values),
+        np.array(values, dtype=np.float64),
+        np.array(values, dtype=np.float32),
+        np.arange(1000, dtype=np.int64),
+        np.array(values, dtype=np.float64)[::-1][::-1],   # a non-contiguous view
+    ]
+
+    for source in sources:
+        x = mc.Digest(maxBins=32)
+        x.fit(source)
+
+        assert np.array_equal(x.getBins(), reference.getBins())
+        assert np.array_equal(x.getWeights(), reference.getWeights())
+
+
+def test_a_digest_allocates_nothing_until_it_is_used():
+    """Tests that a digest that has never held a point still behaves like one.
+
+    The centroid buffers are allocated on first use rather than in __init__,
+    because Normal, NegBinom and Constant never read them at all and asRanVar()
+    wraps every plain number in a Constant. Nothing above that should be able
+    to tell.
+    """
+    x = mc.Digest(maxBins=16)
+
+    assert x.getActiveBinCount() == 0
+    assert list(x.getBins()) == []
+    assert list(x.getWeights()) == []
+    assert x.toDict()['bins'] == []
+
+    for empty in [x.lower, x.upper, x.mean]:
+        with pytest.raises(ValueError):
+            empty()
+
+    # A round trip before the buffers exist has to leave a working digest.
+    for y in [pickle.loads(pickle.dumps(x)), copy.deepcopy(x), mc.Digest.fromDict(x.toDict())]:
+        assert y.getActiveBinCount() == 0
+
+        for e in [3.0, 1.0, 2.0]:
+            y.add(e)
+
+        assert list(y.getBins()) == [1.0, 2.0, 3.0]
+
+    # And so does using the original afterwards.
+    for e in [3.0, 1.0, 2.0]:
+        x.add(e)
+
+    assert list(x.getBins()) == [1.0, 2.0, 3.0]
+    assert x.quantile(0.5) == 2.0
+
+
+def test_cdf_interpolates_single_weight_centroids_as_before():
+    """Tests the CDF's special cases for centroids carrying a weight of one.
+
+    A centroid of weight one sits on an exact observation, so a segment between
+    two of them has no interior to interpolate across and the CDF steps rather
+    than ramps. These are the branches a digest holding fewer points than bins
+    takes, and they are the ones a total taken from the ladder's cache would be
+    wrong for if it were not accumulated the same way.
+    """
+    steps = mc.Digest(maxBins=8)
+    steps.fit([1.0, 2.0, 3.0])
+
+    assert list(steps.getWeights()) == [1.0, 1.0, 1.0]
+    assert steps.cdf(1.0) == 0.0
+    assert steps.cdf(1.5) == 0.0
+    assert steps.cdf(2.5) == 1.0 / 3.0
+    assert steps.cdf(3.0) == 1.0
+
+    # One interior centroid heavy enough to interpolate across.
+    ramp = mc.Digest(maxBins=8)
+    ramp.fit([1.0, 2.0, 2.0, 2.0, 3.0])
+
+    assert list(ramp.getWeights()) == [1.0, 3.0, 1.0]
+    assert ramp.cdf(2.5) == 0.65
+    assert ramp.dcdf(2.5) == 0.3
+
+
+def test_cdf_and_dcdf_survive_points_added_after_a_query():
+    """Tests that both readers see centroids added since they last ran.
+
+    They take the total weight from the cache the ladder keeps, which is only
+    valid while the ladder is, so they have to honour the same stale flag
+    quantile() does.
+    """
+    np.random.seed(31337)
+    data = np.random.randn(400)*10 + 50
+
+    live = mc.Digest(maxBins=16)
+
+    for i, e in enumerate(data):
+        live.add(e)
+
+        if i < 2:
+            continue
+
+        # Querying here populates the cache, so the next add has to clear it.
+        live.cdf(50.0)
+
+        fresh = mc.Digest(maxBins=16)
+        fresh.fit(data[:i+1])
+
+        assert live.cdf(50.0) == fresh.cdf(50.0), f'stale total after {i+1} points'
+        assert live.dcdf(50.0) == fresh.dcdf(50.0), f'stale total after {i+1} points'

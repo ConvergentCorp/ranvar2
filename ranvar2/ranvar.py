@@ -94,6 +94,9 @@ class RanVar():
     _total: cdouble
     _stale: cint
 
+    # Whether the four buffers above have been allocated yet. See _allocate().
+    _ready: cint
+
     def __init__(self, maxBins=32):
         """Initialize a new t-digest.
 
@@ -119,6 +122,37 @@ class RanVar():
         self.maxBins = maxBins
         self.nActive = 0
 
+        # The buffers are not allocated here. Four numpy arrays cost more than
+        # everything else about constructing a digest put together, and a good
+        # many digests never need them: Normal, NegBinom and Constant draw from
+        # parameters and never touch a centroid, and asRanVar() wraps every
+        # plain number a caller passes in a Constant. _allocate() puts them in
+        # place the first time something actually reads or writes one.
+        self.bins = None
+        self.cnts = None
+        self.cumw = None
+        self.gaps = None
+
+        self._total = 0
+        self._stale = 1
+        self._ready = 0
+
+    @cfunc
+    @final
+    def _allocate(self) -> cvoid:
+        """Put the centroid buffers in place, if they are not there already.
+
+        Called from wherever one of them is about to be read or written, which
+        is _add() and _rebuildLadder() on the hot paths and a handful of
+        accessors elsewhere. Idempotent, and cheap enough to call every time:
+        it is a flag test once the buffers exist.
+
+        The arrays run one past the bin ceiling because _add() writes the new
+        centroid into the spare slot before merging back down to maxBins.
+        """
+        if self._ready:
+            return
+
         self.bins = np.zeros(self.maxBins + 1, dtype=np.float64)
         self.cnts = np.zeros(self.maxBins + 1, dtype=np.float64)
         self.cumw = np.zeros(self.maxBins + 1, dtype=np.float64)
@@ -129,8 +163,7 @@ class RanVar():
         self._cumw = self.cumw
         self._gaps = self.gaps
 
-        self._total = 0
-        self._stale = 1
+        self._ready = 1
 
     @cfunc
     @final
@@ -300,6 +333,9 @@ class RanVar():
             point (float): The value to add.
             count (float): The weight/count of the value.
         """
+        if not self._ready:
+            self._allocate()
+
         bins: p_double = address(self._bins[0])
         cnts: p_double = address(self._cnts[0])
 
@@ -393,7 +429,8 @@ class RanVar():
     @wraparound(False)
     @cdivision(True)
     @initializedcheck(False)
-    def _interpolationBounds(self, i: cint, som: cdouble):
+    def _interpolationBounds(self, i: cint, som: cdouble,
+                             yi: p_double, yi_n: p_double) -> cvoid:
         """Cumulative weights bracketing the segment between centroid i and i+1.
 
         We use the approach of Dunning here to improve interpolation when we have
@@ -401,35 +438,37 @@ class RanVar():
         exact observation, so the segment interpolates from the centroid itself
         rather than from its midpoint.
 
+        The two results are written through pointers rather than returned as a
+        pair. Cython types an unannotated return as an object, so returning them
+        built and threw away a Python tuple on every call, which is once per
+        cdf() or dcdf().
+
         Args:
             i (int): Index of the left centroid of the segment.
             som (float): Total weight of all centroids before i.
-
-        Returns:
-            tuple: (yi, yi_n), the cumulative weights at c[i] and c[i+1].
+            yi (double*): Receives the cumulative weight at c[i].
+            yi_n (double*): Receives the cumulative weight at c[i+1].
         """
-        m = self._cnts
+        m: p_double = address(self._cnts[0])
 
         if (m[i] > 1) & (m[i+1] > 1):
             # Case I: Both points greater than one, normal interpolation.
-            yi   = som + m[i]/2
-            yi_n = yi + (m[i+1] + m[i]) / 2
+            yi[0]   = som + m[i]/2
+            yi_n[0] = yi[0] + (m[i+1] + m[i]) / 2
 
         elif (m[i] == 1) & (m[i+1] > 1):
             # Case II: Left point is a single observation.
-            yi   = som
-            yi_n = yi + (m[i+1]) / 2
+            yi[0]   = som
+            yi_n[0] = yi[0] + (m[i+1]) / 2
 
         elif (m[i] > 1) & (m[i+1] == 1):
             # Case III: Right point is a single observation.
-            yi   = som + m[i]/2
-            yi_n = yi + (m[i]) / 2
+            yi[0]   = som + m[i]/2
+            yi_n[0] = yi[0] + (m[i]) / 2
         else:
             # Case IV: Both are single observations, nothing to interpolate over.
-            yi   = som
-            yi_n = yi
-
-        return yi, yi_n
+            yi[0]   = som
+            yi_n[0] = yi[0]
 
     @cfunc
     @final
@@ -451,7 +490,12 @@ class RanVar():
         som: cdouble
         wGap: cdouble
 
-        m = self._cnts
+        if not self._ready:
+            self._allocate()
+
+        m: p_double = address(self._cnts[0])
+        cumw: p_double = address(self._cumw[0])
+        gaps: p_double = address(self._gaps[0])
 
         som = 0
         for i in range(self.nActive):
@@ -460,7 +504,7 @@ class RanVar():
         self._total = som
 
         som = 0
-        self._cumw[0] = 0
+        cumw[0] = 0
 
         for i in range(self.nActive - 1):
             # An outer centroid contributes its full weight to its only segment,
@@ -477,17 +521,20 @@ class RanVar():
             else:
                 wGap = wGap + m[i+1]/2
 
-            self._gaps[i] = wGap
+            gaps[i] = wGap
 
             som = som + wGap
-            self._cumw[i+1] = som
+            cumw[i+1] = som
 
         self._stale = 0
 
     # Public API. --------------------------------------------------------------
 
-    def add(self, point, count=1.0):
+    def add(self, point: cdouble, count: cdouble = 1.0):
         """Add a single weighted observation to the digest.
+
+        Both arguments are annotated, so Cython converts them straight to
+        doubles rather than parsing them as objects and unboxing them inside.
 
         Args:
             point (float): The value to add.
@@ -509,6 +556,9 @@ class RanVar():
         Returns:
             np.ndarray: View of the centroid values, in ascending order.
         """
+        if not self._ready:
+            return np.zeros(0, dtype=np.float64)
+
         return self.bins[:self.nActive]
 
     def getWeights(self):
@@ -517,6 +567,9 @@ class RanVar():
         Returns:
             np.ndarray: View of the centroid weights, aligned with getBins().
         """
+        if not self._ready:
+            return np.zeros(0, dtype=np.float64)
+
         return self.cnts[:self.nActive]
 
     def lower(self):
@@ -541,13 +594,22 @@ class RanVar():
         """
         return self._upper()
 
-    def cdf(self, k):
+    @boundscheck(False)
+    @wraparound(False)
+    @cdivision(True)
+    @initializedcheck(False)
+    def cdf(self, k: cdouble):
         """Compute the cumulative distribution function at a given point.
 
         Implements the CDF estimation algorithm from Ted Dunning's paper
         'Computing Extremely Accurate Quantiles Using t-Digests'. Uses
         different interpolation strategies depending on whether centroids
         represent single points or aggregated ranges.
+
+        The total weight comes from the cache the ladder keeps rather than from
+        _sumWeights(), which walked every centroid again on each call, on top of
+        the walk that finds the segment. _rebuildLadder() accumulates it in the
+        same order _sumWeights() did, so it is the same total to the last bit.
 
         Args:
             k (float): The point at which to evaluate the CDF.
@@ -557,29 +619,37 @@ class RanVar():
         """
         som:cdouble = 0
         i:cint
-
-        c = self._bins
-        m = self._cnts
-
+        yi:cdouble
+        yi_n:cdouble
+        g:cdouble
 
         if k <= self._lower():
             return 0.
         elif k >= self._upper():
             return 1.
-        else:
-            for i in range(self.nActive):
-                if c[i] <= k < c[i+1]:
-                    yi, yi_n = self._interpolationBounds(i, som)
 
-                    g    = (yi_n - yi) / (c[i+1] - c[i])
-                    yk   = g*(k - c[i]) + yi
+        c: p_double = address(self._bins[0])
+        m: p_double = address(self._cnts[0])
 
-                    return yk / self._sumWeights()
+        if self._stale:
+            self._rebuildLadder()
 
-                else:
-                    som += m[i]
-        
-        pass
+        # k is strictly inside the support, so one of these segments holds it
+        # and the loop always returns. The last centroid starts no segment,
+        # which is why this stops one short of it rather than reading the slot
+        # past the live prefix the way it used to.
+        for i in range(self.nActive - 1):
+            if c[i] <= k < c[i+1]:
+                self._interpolationBounds(i, som, address(yi), address(yi_n))
+
+                g = (yi_n - yi) / (c[i+1] - c[i])
+
+                return (g*(k - c[i]) + yi) / self._total
+
+            else:
+                som += m[i]
+
+        return None
 
     def ccdf(self, x):
         """Compute the complementary cumulative distribution function at a point.
@@ -595,13 +665,20 @@ class RanVar():
         """
         return 1 - self.cdf(x)
 
-    def dcdf(self, k):
+    @boundscheck(False)
+    @wraparound(False)
+    @cdivision(True)
+    @initializedcheck(False)
+    def dcdf(self, k: cdouble):
         """Compute the derivative of the CDF at a given point.
 
         The CDF is piecewise linear between centroids, so its derivative is the
         constant gradient of the segment containing k, normalised by the total
         weight. This is the density estimate at k. Outside the support the CDF is
         flat, so the derivative is zero.
+
+        Takes the total from the ladder's cache rather than recomputing it, for
+        the same reason cdf() does.
 
         Args:
             k (float): The point at which to evaluate the derivative.
@@ -611,20 +688,26 @@ class RanVar():
         """
         som:cdouble = 0
         i:cint
-
-        c = self._bins
-        m = self._cnts
+        yi:cdouble
+        yi_n:cdouble
+        g:cdouble
 
         if (k <= self._lower()) or (k >= self._upper()):
             return 0.
 
+        c: p_double = address(self._bins[0])
+        m: p_double = address(self._cnts[0])
+
+        if self._stale:
+            self._rebuildLadder()
+
         for i in range(self.nActive - 1):
             if c[i] <= k < c[i+1]:
-                yi, yi_n = self._interpolationBounds(i, som)
+                self._interpolationBounds(i, som, address(yi), address(yi_n))
 
                 g = (yi_n - yi) / (c[i+1] - c[i])
 
-                return g / self._sumWeights()
+                return g / self._total
 
             else:
                 som += m[i]
@@ -673,9 +756,6 @@ class RanVar():
         hi: cint
         mid: cint
 
-        c   = self._bins
-        cum = self._cumw
-
         if p <= 0:
             return self._lower()
         elif p >= 1:
@@ -683,6 +763,9 @@ class RanVar():
 
         if self._stale:
             self._rebuildLadder()
+
+        c   = self._bins
+        cum = self._cumw
 
         W  = self._total
         w_ = p*W
@@ -756,15 +839,46 @@ class RanVar():
 
         return som / self._sumWeights()
 
+    @cfunc
+    @final
+    @boundscheck(False)
+    @wraparound(False)
+    @initializedcheck(False)
+    def _fitBuffer(self, data: cdouble[::1]) -> cvoid:
+        """Add every value in a contiguous buffer, without leaving C.
+
+        Args:
+            data (double[::1]): The values to add, each with weight 1.
+        """
+        i: cint
+
+        for i in range(data.shape[0]):
+            self._add(data[i], 1.0)
+
     def fit(self, x):
         """Fit the digest to a collection of data points.
 
         This is a convenience method that adds all points in the collection
         to the digest with equal weight.
 
+        A numeric numpy array goes through a C loop over its buffer. Iterating
+        it in Python instead would hand back a fresh numpy scalar per element
+        for _add() to unbox, which costs more per point than a stored float
+        does -- so the array, the obvious thing to fit, used to be the slower
+        thing to fit. Everything else still iterates, so any sequence,
+        generator or iterator works as it did.
+
         Args:
             x (iterable): Collection of numeric values to add to the digest.
         """
+        # Real numbers only: a complex, object or datetime array has no
+        # meaningful double buffer, and falling through leaves it raising out
+        # of _add() the way it always has.
+        if isinstance(x, np.ndarray) and x.ndim == 1 and x.dtype.kind in 'fiub':
+            self._fitBuffer(np.ascontiguousarray(x, dtype=np.float64))
+
+            return
+
         for xx in x:
             self._add(xx, 1.0)
 
@@ -928,6 +1042,20 @@ class RanVar():
         """
         return self.sample()
 
+    def _state(self):
+        """The centroid state __reduce__ hands the unpickler.
+
+        Every subclass's __reduce__ carries the same triple, so allocating the
+        buffers a lazily built digest has not needed yet happens here rather
+        than in each of them.
+
+        Returns:
+            tuple: The (nActive, bins, cnts) triple __setstate__ expects.
+        """
+        self._allocate()
+
+        return (self.nActive, self.bins, self.cnts)
+
     def __reduce__(self):
         """Support pickling and copying.
 
@@ -937,10 +1065,15 @@ class RanVar():
         Returns:
             tuple: The (callable, args, state) triple pickle expects.
         """
-        return (type(self), (self.maxBins,), (self.nActive, self.bins, self.cnts))
+        return (type(self), (self.maxBins,), self._state())
 
     def __setstate__(self, state):
         """Restore the state produced by __reduce__.
+
+        Allocates outright rather than through _allocate(): the centroids
+        arrive here, so a restored digest has buffers whatever the constructor
+        left behind. The ladder is not serialised, so it is sized to match and
+        left at zeros for the first query to rebuild.
 
         Args:
             state (tuple): The (nActive, bins, cnts) triple from __reduce__.
@@ -948,9 +1081,15 @@ class RanVar():
         self.nActive = state[0]
         self.bins = np.array(state[1], dtype=np.float64)
         self.cnts = np.array(state[2], dtype=np.float64)
+        self.cumw = np.zeros(len(self.bins), dtype=np.float64)
+        self.gaps = np.zeros(len(self.bins), dtype=np.float64)
 
         self._bins = self.bins
         self._cnts = self.cnts
+        self._cumw = self.cumw
+        self._gaps = self.gaps
+
+        self._ready = 1
 
         # __init__ has already marked it stale, since __reduce__ rebuilds through
         # the constructor. Repeated here so the rule that any change to the
@@ -1395,7 +1534,7 @@ class Normal(RanVar):
         """
         return (
             type(self), (self._mean, self._std, self.maxBins),
-            (self.nActive, self.bins, self.cnts),
+            self._state(),
         )
 
 
@@ -1747,7 +1886,7 @@ class NegBinom(RanVar):
         """
         return (
             type(self), (self._mean, self._dispersion, self.maxBins),
-            (self.nActive, self.bins, self.cnts),
+            self._state(),
         )
 
 
@@ -1974,7 +2113,7 @@ class Constant(RanVar):
         """
         return (
             type(self), (self._value, self.maxBins),
-            (self.nActive, self.bins, self.cnts),
+            self._state(),
         )
 
 # A collection of digests. -----------------------------------------------------

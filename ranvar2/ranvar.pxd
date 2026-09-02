@@ -38,6 +38,10 @@ cdef class RanVar:
 
     cdef double _total
     cdef int _stale
+    cdef int _ready
+
+    @cython.final
+    cdef void _allocate(self)
 
     @cython.final
     cdef int _findLastLesserOrEqualIndex(self, double *bins, int n, double point)
@@ -52,13 +56,17 @@ cdef class RanVar:
     cdef void _add(self, double point, double count)
 
     @cython.final
+    cdef void _fitBuffer(self, double[::1] data)
+
+    @cython.final
     cdef double _lower(self)
     @cython.final
     cdef double _upper(self)
     @cython.final
     cdef double _sumWeights(self)
     @cython.final
-    cdef _interpolationBounds(self, int i, double som)
+    cdef void _interpolationBounds(self, int i, double som,
+                                   double *yi, double *yi_n)
     @cython.final
     cdef void _rebuildLadder(self)
 
