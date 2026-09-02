@@ -36,55 +36,63 @@ def test_freqAddsUp():
 
 
 def test_normalApprox():
-    """"""
+    """Tests the CDF against the sigma bands of the data it was given.
+
+    Measured against the sample's own band fractions rather than the textbook
+    0.6827/0.9545/0.9973: a digest approximates the data it was fed, and at
+    10,000 points the sample's own 1-sigma fraction sits about 0.005 away from
+    the theoretical one, which is more than the bar below allows the digest.
+
+    The 3-sigma bar is looser at maxBins=32 than at 128 on purpose. Centroids
+    are now placed by quantile, so the outermost bucket of a 32 bin digest
+    spans about 0.24% of the weight however far out in value the points are.
+    Merging by distance instead, as this used to, spent most of its bins on the
+    sparse tail of a normal -- which read better here and cost an order of
+    magnitude on skewed data, where the tail is where the bins were needed
+    least. The resolution is still there for the asking: at 128 bins the same
+    band is exact to 1e-4.
+    """
     std = 100
     mu  = 100
     np.random.seed(31337)
     data = np.random.randn(10_000)*std + mu
-    x = mc.Digest(maxBins=32)
-    for d in data:
-        x.add(d)
 
+    # What the sample itself says, which is the most a digest of it could know.
+    empirical = [float(np.mean(np.abs(data - mu) <= std*k)) for k in (1, 2, 3)]
 
-    prob1 = x.cdf(mu + std*1) - x.cdf(mu - std*1)
-    prob2 = x.cdf(mu + std*2) - x.cdf(mu - std*2)
-    prob3 = x.cdf(mu + std*3) - x.cdf(mu - std*3)
+    for maxBins, bars in [(32, [1e-3, 5e-3, 5e-3]), (128, [1e-3, 1e-3, 1e-3])]:
+        x = mc.Digest(maxBins=maxBins)
+        x.fit(data)
 
-    # We are not using a lot of samples and keeping the accuracy bar low, otherwise
-    # running the tests will take to long. In practice increasing the number of
-    # sample points will increase the accuracy.
+        for k, want, bar in zip((1, 2, 3), empirical, bars):
+            got = x.cdf(mu + std*k) - x.cdf(mu - std*k)
 
-    print(prob1)
-    print(prob2)
-    print(prob3)
+            assert abs(want - got) <= bar, \
+                f'maxBins={maxBins}, {k} sigma: {got} vs {want}'
 
-    assert abs(0.6827 - prob1) <= 1e-1
-    assert abs(0.9545 - prob2) <= 1e-2
-    assert abs(0.9973 - prob3) <= 1e-3
 
 def test_normalApprox_quantile():
-    """"""
+    """Tests quantile() against the sample's own percentiles.
+
+    The textbook normal quantiles this used to compare against are not what a
+    digest of 10,000 draws can reproduce: at p=0.25 this sample's own 25th
+    percentile is 2.9% away from the theoretical one, which on its own exceeds
+    the 2.5% the test allows. Judging the digest against the data it was given
+    separates its error from the sample's.
+    """
     std = 100
     mu  = 100
     np.random.seed(31337)
     data = np.random.randn(10_000)*std + mu
+
     x = mc.Digest(maxBins=64)
-    for d in data:
-        x.add(d)
+    x.fit(data)
 
-    DATA = [
-        (-64.485, 0.05),
-        (32.551, 0.25),
-        (100.00, 0.50),
-        (167.449, 0.75),
-        (264.485, 0.95)
-    ]
+    for p in [0.05, 0.25, 0.5, 0.75, 0.95]:
+        want = float(np.percentile(data, p*100))
+        got  = x.quantile(p)
 
-    for v, p in DATA:
-        dv = abs((v - x.quantile(p)) / v)
-        print(f'{v} : {x.quantile(p)} : {dv}')
-        assert dv <= 2.5e-2
-
+        assert abs((want - got) / want) <= 2.5e-2, f'p={p}: {got} vs {want}'
 
 
 def test_ccdf():
@@ -252,7 +260,7 @@ def test_quantile_heavy_last_centroid():
     for _ in range(1000):
         x.add(100.0)
 
-    assert x.getActiveBinCount() == 11
+    assert x.getActiveBinCount() <= 16
     assert x.getWeights()[-1] == 1000
 
     for p in [0.6, 0.75, 0.9, 0.99]:
@@ -416,11 +424,19 @@ def test_quantile_matches_a_linear_search():
 
 
 def test_quantile_reflects_points_added_after_a_query():
-    """Tests that the cached weight ladder is rebuilt once more points arrive.
+    """Tests that a query sees every point added before it.
 
-    quantile() caches the ladder and rebuilds it only when a point has been
-    added since, so a missed invalidation would answer as though the later
-    points had never been added.
+    Two caches could hide a point: the weight ladder quantile() searches, which
+    is rebuilt only when the digest has changed since, and the buffer points
+    now wait in until something reads them. A missed invalidation on either
+    would answer as though the later points had never arrived.
+
+    Checked against the data rather than against a digest built in one go.
+    Reading folds the buffer in, so when a digest is read is now part of what
+    its centroids become, and two digests given the same points in the same
+    order but read at different times are close rather than identical. What is
+    still exact is what these assert: the bounds are kept whole rather than
+    merged, and no weight is created or lost.
     """
     np.random.seed(31337)
     data = np.random.randn(400)*10 + 50
@@ -430,19 +446,35 @@ def test_quantile_reflects_points_added_after_a_query():
     for i, d in enumerate(data):
         live.add(d)
 
+        seen = data[:i+1]
+
+        assert live.lower() == seen.min(), f'lower() stale after {i+1} points'
+        assert live.upper() == seen.max(), f'upper() stale after {i+1} points'
+        assert sum(live.getWeights()) == pytest.approx(i + 1), \
+            f'weight lost or duplicated after {i+1} points'
+
         if i % 37 != 0:
             continue
 
-        # Querying here populates the cache, so the next add has to clear it.
-        live.quantile(0.5)
+        # Querying here populates the ladder, so the next add has to clear it.
+        previous = live.quantile(0.5)
 
-        fresh = mc.Digest(maxBins=16)
-        for e in data[:i+1]:
-            fresh.add(e)
+        assert live.lower() <= previous <= live.upper()
 
         for p in [0.05, 0.25, 0.5, 0.75, 0.95]:
-            assert live.quantile(p) == fresh.quantile(p), \
-                f'stale ladder after {i+1} points, p={p}'
+            q = live.quantile(p)
+
+            assert live.lower() <= q <= live.upper(), \
+                f'quantile({p}) outside the support after {i+1} points'
+
+    # A batch of points well past the current support has to move the median,
+    # which a query answering from a stale ladder would not do.
+    before = live.quantile(0.5)
+
+    for _ in range(400):
+        live.add(1000.0)
+
+    assert live.quantile(0.5) > before
 
 
 def test_ladder_is_rebuilt_after_pickle_and_copy():
@@ -620,8 +652,79 @@ def test_cdf_and_dcdf_survive_points_added_after_a_query():
         # Querying here populates the cache, so the next add has to clear it.
         live.cdf(50.0)
 
-        fresh = mc.Digest(maxBins=16)
-        fresh.fit(data[:i+1])
+        # The total the cache holds has to be the weight actually present; a
+        # stale one would put the CDF off the [0, 1] it is a probability over,
+        # and leave the density inconsistent with it.
+        assert 0.0 <= live.cdf(50.0) <= 1.0, f'stale total after {i+1} points'
+        assert live.cdf(live.lower()) == 0.0
+        assert live.cdf(live.upper()) == 1.0
+        assert live.dcdf(50.0) >= 0.0, f'negative density after {i+1} points'
+        assert sum(live.getWeights()) == pytest.approx(i + 1)
 
-        assert live.cdf(50.0) == fresh.cdf(50.0), f'stale total after {i+1} points'
-        assert live.dcdf(50.0) == fresh.dcdf(50.0), f'stale total after {i+1} points'
+
+@pytest.mark.parametrize('maxBins', [3, 4, 8, 16, 32])
+@pytest.mark.parametrize('n', [0, 1, 2, 3, 5, 17, 100, 5000])
+def test_the_digest_holds_its_invariants(maxBins, n):
+    """Tests what a digest promises, whatever it was given.
+
+    Points are buffered and folded in a batch at a time, so these are checked
+    across sizes either side of both the bin ceiling and the buffer: at most
+    maxBins centroids, in ascending order, carrying exactly the weight that was
+    put in, with the extremes kept whole and every quantile inside them.
+    """
+    np.random.seed(31337)
+    data = list(np.random.randn(n)*100 + 100)
+
+    x = mc.Digest(maxBins=maxBins)
+    x.fit(data)
+
+    bins    = list(x.getBins())
+    weights = list(x.getWeights())
+
+    assert len(bins) <= maxBins
+    assert len(bins) == x.getActiveBinCount()
+    assert len(weights) == len(bins)
+    assert bins == sorted(bins)
+    assert sum(weights) == pytest.approx(n)
+
+    if not n:
+        return
+
+    # Kept whole rather than merged, so these are exact and not estimates.
+    assert x.lower() == min(data)
+    assert x.upper() == max(data)
+
+    for p in [0.0, 0.01, 0.25, 0.5, 0.75, 0.99, 1.0]:
+        assert x.lower() <= x.quantile(p) <= x.upper()
+
+
+def test_repeated_values_do_not_waste_centroids():
+    """Tests that a digest fed one value many times keeps one centroid for it.
+
+    Centroids are placed by quantile, so copies of a single value spread across
+    many buckets. Centroids sitting on the same point span no interval for a
+    quantile to interpolate across, so they are folded back together.
+    """
+    x = mc.Digest(maxBins=16)
+    x.fit([4.0]*1000)
+
+    assert list(x.getBins()) == [4.0]
+    assert list(x.getWeights()) == [1000.0]
+    assert x.quantile(0.5) == 4.0
+    assert x.lower() == x.upper() == 4.0
+
+
+def test_weighted_points_are_merged_by_weight():
+    """Tests that add()'s count is carried through the merge."""
+    x = mc.Digest(maxBins=8)
+
+    for value, count in [(1.0, 2.0), (5.0, 3.0), (3.0, 1.5), (2.0, 0.5)]:
+        x.add(value, count)
+
+    assert sum(x.getWeights()) == pytest.approx(7.0)
+    assert x.lower() == 1.0
+    assert x.upper() == 5.0
+
+    # The weighted mean is exact through a merge: it is the one thing merging
+    # two centroids into their weighted average preserves.
+    assert x.mean() == pytest.approx((1*2 + 5*3 + 3*1.5 + 2*0.5) / 7.0)

@@ -1,6 +1,6 @@
 [project]
 name = "ranvar2"
-version = "0.1.3"
+version = "0.2.0"
 description = "Fast probabilistic modelling: t-digest random variables and Monte Carlo models compiled with Cython"
 readme = "README.md"
 requires-python = ">=3.12"

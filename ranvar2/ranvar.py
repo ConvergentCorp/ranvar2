@@ -13,6 +13,7 @@ from cython import int as cint
 from cython import void as cvoid
 
 from cython.cimports.libc.string import memmove
+from cython.cimports.libc.string import memcpy
 
 from cython.cimports.libc.stdlib import rand as crand
 from cython.cimports.libc.stdlib import srand as csrand
@@ -72,12 +73,28 @@ class RanVar():
     by Ted Dunning. This data structure provides approximate quantile computation with bounded
     memory usage and high accuracy, particularly at the tails of the distribution.
 
-    The digest maintains a set of centroids (weighted points) that summarize the distribution.
-    When the number of centroids exceeds maxBins, nearby centroids are merged to maintain
-    the memory bound while preserving accuracy.
+    The digest maintains a set of centroids (weighted points) that summarize the
+    distribution, at most maxBins of them.
+
+    Points are not merged in as they arrive. They wait in a buffer, and when it
+    fills, the whole batch is sorted once and merged with the centroids in a
+    single pass -- which is why adding a point costs a store rather than a walk
+    of the centroids, and why the cost of adding one barely grows with maxBins.
+    Every read folds the buffer in first, so nothing outside the class can
+    observe it; the one thing that follows from it is that reading a digest is
+    part of how its centroids come out, so the same points added in the same
+    order but read at different times give centroids that are close rather than
+    identical.
+
+    Which centroids survive a merge is decided by Dunning's K_1 scale function:
+    the weight is cut into maxBins buckets of equal k, which are narrow at the
+    tails and wide in the middle, so the digest keeps its resolution where a
+    quantile estimate needs it. The smallest and largest points are always kept
+    whole, so lower() and upper() are exactly the minimum and maximum of
+    everything added.
 
     quantile() walks a ladder of cumulative weights, one rung per pair of
-    adjacent centroids. That ladder only changes when a point is added, so it is
+    adjacent centroids. That ladder only changes when the centroids do, so it is
     cached and searched rather than rebuilt on every call, which is what makes
     repeated sampling from a fitted digest cheap.
 
@@ -86,8 +103,11 @@ class RanVar():
         cnts (np.ndarray): Array storing centroid weights (counts)
         cumw (np.ndarray): Cached cumulative weight at the start of each segment
         gaps (np.ndarray): Cached weight spanned by each segment
+        buf (np.ndarray): Points waiting to be merged in
+        bufw (np.ndarray): Their weights, aligned with buf
         maxBins (int): Maximum number of centroids to maintain
         nActive (int): Current number of active centroids
+        nBuf (int): How many points are waiting in the buffer
 
     Example:
         >>> ranvar = RanVar(maxBins=100)
@@ -105,8 +125,27 @@ class RanVar():
     cumw: np.ndarray
     gaps: np.ndarray
 
+    # Points wait here until there are enough of them to be worth merging.
+    # _tb/_tc are the merge sort's scratch space, nothing more.
+    _buf: cdouble[::1]
+    _bufw: cdouble[::1]
+    _tb: cdouble[::1]
+    _tc: cdouble[::1]
+
+    # The quantile each of the maxBins buckets closes at. See _allocate().
+    _bnds: cdouble[::1]
+
+    buf: np.ndarray
+    bufw: np.ndarray
+    tb: np.ndarray
+    tc: np.ndarray
+    bnds: np.ndarray
+
     maxBins: cint
     nActive: cint
+
+    bufCap: cint
+    nBuf: cint
 
     # Total weight as _sumWeights() would compute it, cached alongside the
     # ladder, and a flag saying whether either still reflects the centroids.
@@ -141,6 +180,13 @@ class RanVar():
         self.maxBins = maxBins
         self.nActive = 0
 
+        # Two buffers' worth per bin ceiling. Larger amortises the merge over
+        # more points but makes each one longer to sort; measured flat from
+        # roughly two to ten, so this is the small end of the plateau. The
+        # floor keeps a tiny digest from flushing every few points.
+        self.bufCap = maxBins * 2 if maxBins * 2 > 32 else 32
+        self.nBuf   = 0
+
         # The buffers are not allocated here. Four numpy arrays cost more than
         # everything else about constructing a digest put together, and a good
         # many digests never need them: Normal, NegBinom and Constant draw from
@@ -151,6 +197,11 @@ class RanVar():
         self.cnts = None
         self.cumw = None
         self.gaps = None
+        self.buf  = None
+        self.bufw = None
+        self.tb   = None
+        self.tc   = None
+        self.bnds = None
 
         self._total = 0
         self._stale = 1
@@ -166,21 +217,44 @@ class RanVar():
         accessors elsewhere. Idempotent, and cheap enough to call every time:
         it is a flag test once the buffers exist.
 
-        The arrays run one past the bin ceiling because _add() writes the new
-        centroid into the spare slot before merging back down to maxBins.
+        The centroid arrays carry a whole buffer beyond the bin ceiling. A
+        flush merges the buffer into them before compressing back under it, and
+        merging in place from the top is what saves a second pair of arrays to
+        merge into.
         """
         if self._ready:
             return
 
-        self.bins = np.zeros(self.maxBins + 1, dtype=np.float64)
-        self.cnts = np.zeros(self.maxBins + 1, dtype=np.float64)
+        self.bins = np.zeros(self.maxBins + self.bufCap + 1, dtype=np.float64)
+        self.cnts = np.zeros(self.maxBins + self.bufCap + 1, dtype=np.float64)
         self.cumw = np.zeros(self.maxBins + 1, dtype=np.float64)
         self.gaps = np.zeros(self.maxBins + 1, dtype=np.float64)
+
+        self.buf  = np.zeros(self.bufCap, dtype=np.float64)
+        self.bufw = np.zeros(self.bufCap, dtype=np.float64)
+        self.tb   = np.zeros(self.bufCap, dtype=np.float64)
+        self.tc   = np.zeros(self.bufCap, dtype=np.float64)
+
+        # Dunning's K_1 scale function, k(q) = asin(2q - 1), cut into maxBins
+        # equal steps of k and inverted back into quantiles. Steep at both ends,
+        # so the buckets are narrow at the tails and wide in the middle: that is
+        # what puts the digest's resolution where a quantile estimate needs it.
+        # The last entry is exactly 1, so the last bucket takes whatever is left.
+        # Fixed by maxBins, so built once here rather than recomputed per flush.
+        steps     = np.arange(1, self.maxBins + 1, dtype=np.float64)
+        self.bnds = (np.sin(-np.pi/2 + steps * np.pi / self.maxBins) + 1.0) * 0.5
+        self.bnds[self.maxBins - 1] = 1.0
 
         self._bins = self.bins
         self._cnts = self.cnts
         self._cumw = self.cumw
         self._gaps = self.gaps
+
+        self._buf  = self.buf
+        self._bufw = self.bufw
+        self._tb   = self.tb
+        self._tc   = self.tc
+        self._bnds = self.bnds
 
         self._ready = 1
 
@@ -189,164 +263,279 @@ class RanVar():
     @boundscheck(False)
     @wraparound(False)
     @initializedcheck(False)
-    def _findLastLesserOrEqualIndex(self, bins: p_double, n: cint, point: cdouble) -> cint:
-        """Find the index of the last centroid that is <= the given point.
+    def _sortBuffer(self) -> cvoid:
+        """Sort the pending buffer by value, carrying the weights with it.
 
-        The centroids are sorted, so this bisects rather than walking them: the
-        scan this replaced cost on the order of maxBins probes per point, and
-        the insert is one of three passes over the array that _add() already
-        makes.
-
-        Args:
-            bins (double*): The centroid values, ascending.
-            n (int): How many of them are live.
-            point (float): The value to search for.
-
-        Returns:
-            int: Index of the last centroid <= point, or -1 if point is smaller
-                than all centroids.
+        A bottom-up merge sort, ping-ponging between the buffer and the scratch
+        pair and copying back only if it finishes on the wrong side. Stable, so
+        equal values keep the order they arrived in.
         """
-        lo: cint = 0
-        hi: cint = n
-        mid: cint
+        n: cint = self.nBuf
 
-        # Settles on the first centroid strictly greater than point, so the one
-        # before it is the last that is not. Landing after a run of equal
-        # centroids rather than before it is what the walk did too.
-        while lo < hi:
-            mid = (lo + hi) >> 1
+        srcV: p_double = address(self._buf[0])
+        srcW: p_double = address(self._bufw[0])
+        dstV: p_double = address(self._tb[0])
+        dstW: p_double = address(self._tc[0])
+        swap: p_double
 
-            if bins[mid] <= point:
-                lo = mid + 1
-            else:
-                hi = mid
-
-        return lo - 1
-
-    @cfunc
-    @final
-    @boundscheck(False)
-    @wraparound(False)
-    @initializedcheck(False)
-    def _shiftRightAndInsert(self, bins: p_double, cnts: p_double, idx: cint,
-                             point: cdouble, count: cdouble) -> cvoid:
-        """Insert a new centroid at the specified position by shifting elements right.
-
-        This method maintains the sorted order of centroids by shifting all centroids
-        to the right of the insertion point and inserting the new centroid.
-
-        The shift goes through memmove rather than an element loop: it is a
-        contiguous block move, which memmove does word at a time.
-
-        Args:
-            bins (double*): The centroid values.
-            cnts (double*): The centroid weights, aligned with bins.
-            idx (int): Index after which to insert the new centroid.
-            point (float): Value of the new centroid.
-            count (float): Weight of the new centroid.
-        """
-        n: cint = self.nActive
-        moved: cint = n - 1 - idx
-
-        if moved > 0:
-            memmove(address(bins[idx+2]), address(bins[idx+1]), moved * sizeof(cdouble))
-            memmove(address(cnts[idx+2]), address(cnts[idx+1]), moved * sizeof(cdouble))
-
-        bins[idx+1] = point
-        cnts[idx+1] = count
-
-        self.nActive = n + 1
-
-    @cfunc
-    @final
-    @boundscheck(False)
-    @wraparound(False)
-    @initializedcheck(False)
-    def _findMinimumDifference(self, bins: p_double, n: cint) -> cint:
-        """Find the pair of adjacent centroids with minimum distance.
-
-        This method is used when the digest exceeds maxBins to identify which
-        centroids should be merged. It avoids merging the first and last centroids
-        to preserve the tails of the distribution.
-
-        _add() calls this only on an overflowing digest, where n is maxBins + 1,
-        and __init__ refuses a maxBins below 3. The scanned range is therefore
-        never empty and the -1 below is unreachable, which is what lets _add()
-        use the result as an index without checking it.
-
-        Args:
-            bins (double*): The centroid values, ascending.
-            n (int): How many of them are live.
-
-        Returns:
-            int: Index of the first centroid in the pair with minimum distance,
-                or -1 if no suitable pair is found.
-        """
+        width: cint = 1
+        i: cint
+        l: cint
+        r: cint
+        lEnd: cint
+        rEnd: cint
         k: cint
-        dB: cdouble
-        minK: cint
-        minDiff: cdouble
 
-        minK    = -1
-        minDiff = 9e9
-        # We don't want to merge the first or last bin because we want to maintain the
-        # tails. It also solves the problem where we try and sample a point that is before
-        # the first centroid.
-        for k in range(1, n - 2):
-            dB = bins[k+1] - bins[k]
-            if dB < minDiff:
-                minDiff = dB
-                minK    = k
+        while width < n:
+            i = 0
 
-        return minK
+            while i < n:
+                l    = i
+                lEnd = i + width
+                rEnd = i + 2*width
+
+                if lEnd > n:
+                    lEnd = n
+
+                if rEnd > n:
+                    rEnd = n
+
+                r = lEnd
+                k = i
+
+                while (l < lEnd) and (r < rEnd):
+                    if srcV[l] <= srcV[r]:
+                        dstV[k] = srcV[l]
+                        dstW[k] = srcW[l]
+                        l += 1
+                    else:
+                        dstV[k] = srcV[r]
+                        dstW[k] = srcW[r]
+                        r += 1
+
+                    k += 1
+
+                while l < lEnd:
+                    dstV[k] = srcV[l]
+                    dstW[k] = srcW[l]
+                    l += 1
+                    k += 1
+
+                while r < rEnd:
+                    dstV[k] = srcV[r]
+                    dstW[k] = srcW[r]
+                    r += 1
+                    k += 1
+
+                i += 2*width
+
+            swap = srcV; srcV = dstV; dstV = swap
+            swap = srcW; srcW = dstW; dstW = swap
+
+            width *= 2
+
+        if srcV != address(self._buf[0]):
+            memcpy(address(self._buf[0]),  srcV, n * sizeof(cdouble))
+            memcpy(address(self._bufw[0]), srcW, n * sizeof(cdouble))
 
     @cfunc
     @final
-    @boundscheck(False)
-    @wraparound(False)
-    @initializedcheck(False)
-    def _shiftLeftAndOverride(self, bins: p_double, cnts: p_double, idx: cint) -> cvoid:
-        """Remove a centroid by shifting all subsequent centroids left.
-
-        This method maintains the sorted order and compactness of the centroid
-        arrays by removing the centroid at the specified index.
-
-        Args:
-            bins (double*): The centroid values.
-            cnts (double*): The centroid weights, aligned with bins.
-            idx (int): Index of the centroid to remove.
-        """
-        n: cint = self.nActive
-        moved: cint = n - 1 - idx
-
-        if moved > 0:
-            memmove(address(bins[idx]), address(bins[idx+1]), moved * sizeof(cdouble))
-            memmove(address(cnts[idx]), address(cnts[idx+1]), moved * sizeof(cdouble))
-
-        bins[n-1] = 0
-        cnts[n-1] = 0
-
-        self.nActive = n - 1
-
-    @cfunc
     @boundscheck(False)
     @wraparound(False)
     @cdivision(True)
     @initializedcheck(False)
+    def _compress(self, m: cint) -> cvoid:
+        """Reduce m sorted weighted points, held in the centroid arrays, to at
+        most maxBins centroids.
+
+        One pass. Each point is placed by the quantile of its own midpoint, and
+        stays in the centroid being built while that quantile is inside the
+        current bucket; the first point past the bucket closes it and opens the
+        next. Since a centroid is only opened when a bucket is, and there are
+        maxBins buckets, the result cannot exceed the ceiling.
+
+        The lowest and highest points are kept as centroids of their own, so
+        lower() and upper() stay the exact minimum and maximum of everything
+        added, as they were when centroids were merged one pair at a time.
+
+        Writing is always behind reading -- the centroid being closed sits at
+        an index below the point being read -- so this compresses in place.
+
+        Args:
+            m (int): How many sorted points the arrays hold.
+        """
+        bins: p_double = address(self._bins[0])
+        cnts: p_double = address(self._cnts[0])
+        bnds: p_double = address(self._bnds[0])
+
+        i: cint
+        j: cint
+        out: cint
+        w: cint
+        r: cint
+
+        total: cdouble
+        before: cdouble
+        q: cdouble
+        qEnd: cdouble
+        sumX: cdouble
+        sumW: cdouble
+
+        if m <= 2:
+            self.nActive = m
+
+            return
+
+        total = 0
+        for i in range(m):
+            total = total + cnts[i]
+
+        # The minimum, kept whole.
+        out    = 0
+        before = cnts[0]
+
+        # The first interior point opens the second centroid, in whichever
+        # bucket its own quantile falls.
+        out  = 1
+        sumX = bins[1] * cnts[1]
+        sumW = cnts[1]
+
+        j    = 0
+        qEnd = bnds[0]
+        q    = (before + cnts[1] * 0.5) / total
+
+        while (q > qEnd) and (j < self.maxBins - 1):
+            j += 1
+            qEnd = bnds[j]
+
+        before = before + cnts[1]
+
+        for i in range(2, m - 1):
+            q = (before + cnts[i] * 0.5) / total
+
+            # The ceiling is enforced here rather than trusted to the bucket
+            # count: a quantile that rounds a hair past 1 would otherwise open
+            # a centroid the arrays have no room for. One slot is left for the
+            # maximum below.
+            if (q <= qEnd) or (out >= self.maxBins - 2):
+                sumX = sumX + bins[i] * cnts[i]
+                sumW = sumW + cnts[i]
+            else:
+                bins[out] = sumX / sumW
+                cnts[out] = sumW
+
+                out += 1
+
+                while (q > qEnd) and (j < self.maxBins - 1):
+                    j += 1
+                    qEnd = bnds[j]
+
+                sumX = bins[i] * cnts[i]
+                sumW = cnts[i]
+
+            before = before + cnts[i]
+
+        bins[out] = sumX / sumW
+        cnts[out] = sumW
+
+        # The maximum, kept whole.
+        out += 1
+        bins[out] = bins[m-1]
+        cnts[out] = cnts[m-1]
+
+        self.nActive = out + 1
+
+        # Points that landed in different buckets can still share a value --
+        # a digest fed one number many times over is the plain case -- and
+        # centroids sitting on top of each other span no interval for a
+        # quantile to interpolate across, so they are folded together.
+        w = 0
+        for r in range(1, self.nActive):
+            if bins[r] == bins[w]:
+                cnts[w] = cnts[w] + cnts[r]
+            else:
+                w += 1
+                bins[w] = bins[r]
+                cnts[w] = cnts[r]
+
+        self.nActive = w + 1
+
+    @cfunc
+    @final
+    @boundscheck(False)
+    @wraparound(False)
+    @initializedcheck(False)
+    def _flush(self) -> cvoid:
+        """Fold the pending buffer into the centroids.
+
+        Sorts the buffer, merges it with the centroids -- both runs are sorted,
+        so that is one linear pass, walked from the top because the centroid
+        arrays have the buffer's worth of room at the end -- and compresses the
+        result back under the bin ceiling.
+
+        This is where the digest does its work. Buffering is what makes it
+        worth doing: the cost of a flush is shared across a whole buffer's
+        worth of points, where inserting each point into the centroids as it
+        arrived cost a walk of them per point.
+        """
+        if self.nBuf == 0:
+            return
+
+        self._sortBuffer()
+
+        bins: p_double = address(self._bins[0])
+        cnts: p_double = address(self._cnts[0])
+        buf: p_double  = address(self._buf[0])
+        bufw: p_double = address(self._bufw[0])
+
+        i: cint = self.nActive - 1
+        k: cint = self.nBuf - 1
+        w: cint = self.nActive + self.nBuf - 1
+
+        m: cint = w + 1
+
+        # Merged from the top down, so the write head stays above both read
+        # heads and nothing is overwritten before it is read.
+        while (i >= 0) and (k >= 0):
+            if bins[i] > buf[k]:
+                bins[w] = bins[i]
+                cnts[w] = cnts[i]
+                i -= 1
+            else:
+                bins[w] = buf[k]
+                cnts[w] = bufw[k]
+                k -= 1
+
+            w -= 1
+
+        while k >= 0:
+            bins[w] = buf[k]
+            cnts[w] = bufw[k]
+            k -= 1
+            w -= 1
+
+        # Whatever centroids are left already sit where they belong.
+
+        self.nBuf = 0
+
+        self._compress(m)
+
+        self._stale = 1
+
+    @cfunc
+    @boundscheck(False)
+    @wraparound(False)
+    @initializedcheck(False)
     def _add(self, point:cdouble, count:cdouble) -> cvoid:
         """Add a weighted point to the digest (internal implementation).
 
-        This is the core method that implements the t-digest algorithm. It either
-        updates an existing centroid if the point matches exactly, or inserts a new
-        centroid. If the number of centroids exceeds maxBins, it merges the two
-        closest centroids.
+        The point is written to a buffer rather than into the centroids. When
+        the buffer fills, _flush() sorts it and merges the whole batch in one
+        pass. That is what a simulation's inner loop calls, once per sample, so
+        it is kept to a bounds-free store and a counter.
 
-        The two buffers are taken as plain pointers once, up front, and passed
-        down rather than reached through self each time. A store through one
-        memoryview may alias the other's descriptor as far as the C compiler
-        can tell, so it has to reload .data after every write it cannot rule
-        that out for; it can keep a local pointer in a register instead. That
-        reload was most of what this method spent on array access.
+        Every read of the digest flushes first, so nothing outside can observe
+        the buffer.
 
         Args:
             point (float): The value to add.
@@ -355,28 +544,13 @@ class RanVar():
         if not self._ready:
             self._allocate()
 
-        bins: p_double = address(self._bins[0])
-        cnts: p_double = address(self._cnts[0])
+        if self.nBuf == self.bufCap:
+            self._flush()
 
-        idx:cint = self._findLastLesserOrEqualIndex(bins, self.nActive, point)
+        self._buf[self.nBuf]  = point
+        self._bufw[self.nBuf] = count
 
-        if (idx >= 0) and bins[idx] == point:
-            cnts[idx] += count
-        else:
-            self._shiftRightAndInsert(bins, cnts, idx, point, count)
-
-        if self.nActive > self.maxBins:
-            k:cint = self._findMinimumDifference(bins, self.nActive)
-
-            sumC:cdouble = cnts[k+1] + cnts[k]
-
-            # Left as two statements: rounding the weighted sum to a double
-            # before dividing is what the merged centroid has always been.
-            bins[k] = (bins[k]*cnts[k] + bins[k+1]*cnts[k+1])
-            bins[k] = bins[k] / sumC
-            cnts[k] = sumC
-
-            self._shiftLeftAndOverride(bins, cnts, k+1)
+        self.nBuf += 1
 
         self._stale = 1
 
@@ -567,6 +741,8 @@ class RanVar():
         Returns:
             int: Count of active centroids, at most maxBins.
         """
+        self._flush()
+
         return self.nActive
 
     def getBins(self):
@@ -575,6 +751,8 @@ class RanVar():
         Returns:
             np.ndarray: View of the centroid values, in ascending order.
         """
+        self._flush()
+
         if not self._ready:
             return np.zeros(0, dtype=np.float64)
 
@@ -586,6 +764,8 @@ class RanVar():
         Returns:
             np.ndarray: View of the centroid weights, aligned with getBins().
         """
+        self._flush()
+
         if not self._ready:
             return np.zeros(0, dtype=np.float64)
 
@@ -600,6 +780,8 @@ class RanVar():
         Raises:
             ValueError: If the digest is empty.
         """
+        self._flush()
+
         return self._lower()
 
     def upper(self):
@@ -611,6 +793,8 @@ class RanVar():
         Raises:
             ValueError: If the digest is empty.
         """
+        self._flush()
+
         return self._upper()
 
     @boundscheck(False)
@@ -641,6 +825,8 @@ class RanVar():
         yi:cdouble
         yi_n:cdouble
         g:cdouble
+
+        self._flush()
 
         if k <= self._lower():
             return 0.
@@ -711,6 +897,8 @@ class RanVar():
         yi_n:cdouble
         g:cdouble
 
+        self._flush()
+
         if (k <= self._lower()) or (k >= self._upper()):
             return 0.
 
@@ -774,6 +962,8 @@ class RanVar():
         lo: cint
         hi: cint
         mid: cint
+
+        self._flush()
 
         if p <= 0:
             return self._lower()
@@ -850,6 +1040,8 @@ class RanVar():
         som: cdouble = 0
         i: cint
 
+        self._flush()
+
         if self.nActive == 0:
             raise ValueError('mean() is undefined for an empty digest')
 
@@ -918,6 +1110,10 @@ class RanVar():
         Returns:
             dict: The digest, as JSON types only.
         """
+        # Before nActive is read, not after: getBins() below would flush the
+        # buffer and hand back centroids the count no longer described.
+        self._flush()
+
         return {
             'type':    type(self).__name__,
             'maxBins': self.maxBins,
@@ -1071,9 +1267,13 @@ class RanVar():
         Returns:
             tuple: The (nActive, bins, cnts) triple __setstate__ expects.
         """
+        self._flush()
         self._allocate()
 
-        return (self.nActive, self.bins, self.cnts)
+        # Only the live prefix: the arrays carry a buffer's worth of slack
+        # past it that means nothing to a reader, and __setstate__ sizes what
+        # it restores into itself.
+        return (self.nActive, self.getBins(), self.getWeights())
 
     def __reduce__(self):
         """Support pickling and copying.
@@ -1098,15 +1298,44 @@ class RanVar():
             state (tuple): The (nActive, bins, cnts) triple from __reduce__.
         """
         self.nActive = state[0]
-        self.bins = np.array(state[1], dtype=np.float64)
-        self.cnts = np.array(state[2], dtype=np.float64)
-        self.cumw = np.zeros(len(self.bins), dtype=np.float64)
-        self.gaps = np.zeros(len(self.bins), dtype=np.float64)
+        self.nBuf    = 0
+
+        # Sized as _allocate() would, not as the payload happens to be: a
+        # restored digest has to have the same room to merge into that a fresh
+        # one does, whatever length of prefix it was handed.
+        self.bins = np.zeros(self.maxBins + self.bufCap + 1, dtype=np.float64)
+        self.cnts = np.zeros(self.maxBins + self.bufCap + 1, dtype=np.float64)
+        self.cumw = np.zeros(self.maxBins + 1, dtype=np.float64)
+        self.gaps = np.zeros(self.maxBins + 1, dtype=np.float64)
+
+        self.bins[:self.nActive] = np.asarray(state[1], dtype=np.float64)[:self.nActive]
+        self.cnts[:self.nActive] = np.asarray(state[2], dtype=np.float64)[:self.nActive]
+
+        self.buf  = np.zeros(self.bufCap, dtype=np.float64)
+        self.bufw = np.zeros(self.bufCap, dtype=np.float64)
+        self.tb   = np.zeros(self.bufCap, dtype=np.float64)
+        self.tc   = np.zeros(self.bufCap, dtype=np.float64)
+
+        # Dunning's K_1 scale function, k(q) = asin(2q - 1), cut into maxBins
+        # equal steps of k and inverted back into quantiles. Steep at both ends,
+        # so the buckets are narrow at the tails and wide in the middle: that is
+        # what puts the digest's resolution where a quantile estimate needs it.
+        # The last entry is exactly 1, so the last bucket takes whatever is left.
+        # Fixed by maxBins, so built once here rather than recomputed per flush.
+        steps     = np.arange(1, self.maxBins + 1, dtype=np.float64)
+        self.bnds = (np.sin(-np.pi/2 + steps * np.pi / self.maxBins) + 1.0) * 0.5
+        self.bnds[self.maxBins - 1] = 1.0
 
         self._bins = self.bins
         self._cnts = self.cnts
         self._cumw = self.cumw
         self._gaps = self.gaps
+
+        self._buf  = self.buf
+        self._bufw = self.bufw
+        self._tb   = self.tb
+        self._tc   = self.tc
+        self._bnds = self.bnds
 
         self._ready = 1
 

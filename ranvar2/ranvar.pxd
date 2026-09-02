@@ -28,13 +28,28 @@ cdef class RanVar:
     cdef double[::1] _cumw
     cdef double[::1] _gaps
 
+    cdef double[::1] _buf
+    cdef double[::1] _bufw
+    cdef double[::1] _tb
+    cdef double[::1] _tc
+    cdef double[::1] _bnds
+
     cdef object bins
     cdef object cnts
     cdef object cumw
     cdef object gaps
 
+    cdef object buf
+    cdef object bufw
+    cdef object tb
+    cdef object tc
+    cdef object bnds
+
     cdef int maxBins
     cdef int nActive
+
+    cdef int bufCap
+    cdef int nBuf
 
     cdef double _total
     cdef int _stale
@@ -44,14 +59,11 @@ cdef class RanVar:
     cdef void _allocate(self)
 
     @cython.final
-    cdef int _findLastLesserOrEqualIndex(self, double *bins, int n, double point)
+    cdef void _sortBuffer(self)
     @cython.final
-    cdef void _shiftRightAndInsert(self, double *bins, double *cnts, int idx,
-                                   double point, double count)
+    cdef void _compress(self, int m)
     @cython.final
-    cdef int _findMinimumDifference(self, double *bins, int n)
-    @cython.final
-    cdef void _shiftLeftAndOverride(self, double *bins, double *cnts, int idx)
+    cdef void _flush(self)
 
     cdef void _add(self, double point, double count)
 
