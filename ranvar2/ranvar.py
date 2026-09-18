@@ -520,6 +520,150 @@ class RanVar():
         """
         return 1 - self.cdf(x)
 
+    def _integral(self, a: cdouble, b: cdouble, complement: cint) -> cdouble:
+        """Area under the CDF, or under the CCDF, between two points.
+
+        Both curves are the same piecewise-linear read of the centroids that
+        cdf() takes, so both integrals are the same walk over the segments
+        between adjacent centroids. Over a segment the curve is a straight
+        line, so its area is exactly the width of the overlap with [a, b]
+        times the height at the middle of that overlap, with no quadrature
+        error to control.
+
+        Outside the support the curve is flat: the CDF is 0 below the
+        smallest centroid and 1 above the largest, the CCDF the other way
+        around, so exactly one of the two tails contributes its full width.
+        That is also what makes the unbounded side of each integral finite,
+        so a=-inf for the CDF and b=+inf for the CCDF are answered rather
+        than refused.
+
+        The interpolated curve jumps at a centroid where a neighbouring
+        weight is one (cdf() reads the segment the point falls in, and the
+        two segments need not agree at the centroid between them), and it
+        jumps again at each end of the support. Those are finitely many
+        points and so carry no area, which is why this still integrates the
+        same function cdf() evaluates.
+
+        Args:
+            a (float): Lower limit, may be -inf.
+            b (float): Upper limit, may be +inf.
+            complement (int): 0 to integrate the CDF, 1 for the CCDF.
+
+        Returns:
+            float: The integral, or +inf where the tail being integrated is
+                 the flat one and the limit on that side is unbounded.
+
+        Raises:
+            ValueError: If the digest is empty, or a limit is NaN.
+        """
+        som: cdouble = 0
+        area: cdouble = 0
+        i: cint
+
+        c = self._bins
+        m = self._cnts
+
+        # Refuses an empty digest before anything indexes the centroids.
+        lo: cdouble = self._lower()
+        hi: cdouble = self._upper()
+
+        if (a != a) or (b != b):
+            raise ValueError('cannot integrate between NaN limits')
+
+        if b == a:
+            return 0.
+
+        # Reversed limits negate the integral, as they do for any integral.
+        if b < a:
+            return -self._integral(b, a, complement)
+
+        W: cdouble = self._sumWeights()
+
+        # The flat tail the curve is 1 over. The other tail is 0 there and
+        # contributes nothing, which is what keeps the opposite limit from
+        # having to be finite.
+        if complement:
+            if a < lo:
+                area = (b if b < lo else lo) - a
+        else:
+            if b > hi:
+                area = b - (a if a > hi else hi)
+
+        for i in range(self.nActive - 1):
+            u: cdouble = a if a > c[i]   else c[i]
+            v: cdouble = b if b < c[i+1] else c[i+1]
+
+            if v > u:
+                yi, yi_n = self._interpolationBounds(i, som)
+
+                g  = (yi_n - yi) / (c[i+1] - c[i])
+
+                # A straight line averages to its height at the midpoint, so
+                # this is the mean of the curve over [u, v] exactly.
+                yk = g*((u + v)/2 - c[i]) + yi
+
+                if complement:
+                    area = area + (v - u) * (W - yk) / W
+                else:
+                    area = area + (v - u) * yk / W
+
+            som += m[i]
+
+        return area
+
+    def cdfIntegral(self, a, b):
+        """Integrate the CDF between two points.
+
+        Computed from the centroids and weights themselves rather than by
+        quadrature: the interpolated CDF is piecewise linear, so each
+        segment contributes the exact area of a trapezium, and the result is
+        the integral of the very function cdf() evaluates.
+
+        The CDF is 0 below the support, so a may be -inf and the answer is
+        still finite. It is 1 above the support, so b=+inf is +inf.
+
+        Args:
+            a (float): Lower limit, may be -inf.
+            b (float): Upper limit.
+
+        Returns:
+            float: The integral of the CDF over [a, b], negated if b < a.
+
+        Raises:
+            ValueError: If the digest is empty, or a limit is NaN.
+
+        Example:
+            >>> x = RanVar(maxBins=32)
+            >>> x.fit([1, 2, 3, 4, 5])
+            >>> x.cdfIntegral(x.lower(), x.upper())  # area under the CDF
+            1.2000000000000002
+        """
+        return self._integral(a, b, 0)
+
+    def ccdfIntegral(self, a, b):
+        """Integrate the complementary CDF between two points.
+
+        The counterpart of cdfIntegral(), computed the same exact way rather
+        than as (b - a) - cdfIntegral(a, b), which would cancel two large
+        numbers against each other once b runs far past the support.
+
+        The CCDF is 0 above the support, so b may be +inf and the answer is
+        still finite: ccdfIntegral(lower(), inf) is the mean measured from
+        the bottom of the support. It is 1 below the support, so a=-inf is
+        +inf.
+
+        Args:
+            a (float): Lower limit.
+            b (float): Upper limit, may be +inf.
+
+        Returns:
+            float: The integral of the CCDF over [a, b], negated if b < a.
+
+        Raises:
+            ValueError: If the digest is empty, or a limit is NaN.
+        """
+        return self._integral(a, b, 1)
+
     def dcdf(self, k):
         """Compute the derivative of the CDF at a given point.
 
@@ -1234,6 +1378,92 @@ class Normal(RanVar):
 
         return 0.5 * cerfc(z)
 
+
+    def cdfIntegral(self, a, b):
+        """Integrate the CDF of Normal(mean, std) between two points.
+
+        Closed form, like cdf() itself: (x - mean)*cdf(x) + std^2*dcdf(x)
+        differentiates back to cdf(x), so the integral is the difference of
+        that antiderivative at the two limits rather than RanVar's walk over
+        a fitted digest's segments.
+
+        The CDF vanishes into the lower tail fast enough for the
+        antiderivative to go to zero with it, so a may be -inf; b=+inf is
+        +inf, since the CDF tends to 1.
+
+        Args:
+            a (float): Lower limit, may be -inf.
+            b (float): Upper limit.
+
+        Returns:
+            float: The integral of the CDF over [a, b], negated if b < a.
+
+        Raises:
+            ValueError: If a limit is NaN.
+        """
+        if (a != a) or (b != b):
+            raise ValueError('cannot integrate between NaN limits')
+
+        if b == a:
+            return 0.
+
+        if b < a:
+            return -self.cdfIntegral(b, a)
+
+        if b == float('inf'):
+            return float('inf')
+
+        v: cdouble = (b - self._mean)*self.cdf(b) + self._std*self._std*self.dcdf(b)
+        u: cdouble = 0.
+
+        if a != float('-inf'):
+            u = (a - self._mean)*self.cdf(a) + self._std*self._std*self.dcdf(a)
+
+        return v - u
+
+    def ccdfIntegral(self, a, b):
+        """Integrate the complementary CDF of Normal(mean, std) between two
+        points.
+
+        The counterpart of cdfIntegral(), with (x - mean)*ccdf(x) -
+        std^2*dcdf(x) as the antiderivative. Written in terms of ccdf()
+        rather than as (b - a) - cdfIntegral(a, b), which would lose the
+        answer to cancellation far into the upper tail, where the same
+        ccdf() is still accurate.
+
+        b may be +inf: ccdfIntegral(mean, inf) is the mean absolute deviation
+        of the upper half. a=-inf is +inf, since the CCDF tends to 1 there.
+
+        Args:
+            a (float): Lower limit.
+            b (float): Upper limit, may be +inf.
+
+        Returns:
+            float: The integral of the CCDF over [a, b], negated if b < a.
+
+        Raises:
+            ValueError: If a limit is NaN.
+        """
+        if (a != a) or (b != b):
+            raise ValueError('cannot integrate between NaN limits')
+
+        if b == a:
+            return 0.
+
+        if b < a:
+            return -self.ccdfIntegral(b, a)
+
+        if a == float('-inf'):
+            return float('inf')
+
+        u: cdouble = (a - self._mean)*self.ccdf(a) - self._std*self._std*self.dcdf(a)
+        v: cdouble = 0.
+
+        if b != float('inf'):
+            v = (b - self._mean)*self.ccdf(b) - self._std*self._std*self.dcdf(b)
+
+        return v - u
+
     def dcdf(self, k):
         """Compute the density of Normal(mean, std) at a point.
 
@@ -1585,6 +1815,33 @@ class NegBinom(RanVar):
             'functions, for the same reason as NegBinom.cdf().'
         )
 
+
+    def cdfIntegral(self, a, b):
+        """Not implemented, for the same reason as cdf().
+
+        The integral of a step function is a sum of its steps, so it needs
+        the CDF at each count in [a, b], which NegBinom has no closed form
+        for.
+
+        Raises:
+            NotImplementedError: Always.
+        """
+        raise NotImplementedError(
+            'NegBinom.cdfIntegral() has no closed form using only standard '
+            'C math functions, for the same reason as NegBinom.cdf().'
+        )
+
+    def ccdfIntegral(self, a, b):
+        """Not implemented, for the same reason as cdfIntegral().
+
+        Raises:
+            NotImplementedError: Always.
+        """
+        raise NotImplementedError(
+            'NegBinom.ccdfIntegral() has no closed form using only standard '
+            'C math functions, for the same reason as NegBinom.cdf().'
+        )
+
     def dcdf(self, k):
         """Not implemented: NegBinom is discrete, so it has no density.
 
@@ -1820,6 +2077,68 @@ class Constant(RanVar):
                  of drawing more than x.
         """
         return 1.0 if x < self._value else 0.0
+
+
+    def cdfIntegral(self, a, b):
+        """Integrate the CDF of the degenerate distribution between two
+        points.
+
+        The CDF is a step: 0 below the value, 1 from it on. So the area is
+        just the length of whatever part of [a, b] lies at or above the
+        value, rather than RanVar's walk over the (empty) inherited digest.
+
+        Args:
+            a (float): Lower limit, may be -inf.
+            b (float): Upper limit.
+
+        Returns:
+            float: The integral of the CDF over [a, b], negated if b < a.
+
+        Raises:
+            ValueError: If a limit is NaN.
+        """
+        if (a != a) or (b != b):
+            raise ValueError('cannot integrate between NaN limits')
+
+        if b == a:
+            return 0.
+
+        if b < a:
+            return -self.cdfIntegral(b, a)
+
+        u: cdouble = a if a > self._value else self._value
+
+        return b - u if b > u else 0.
+
+    def ccdfIntegral(self, a, b):
+        """Integrate the complementary CDF of the degenerate distribution
+        between two points.
+
+        The mirror of cdfIntegral(): the CCDF steps the other way, so this
+        is the length of whatever part of [a, b] lies below the value.
+
+        Args:
+            a (float): Lower limit.
+            b (float): Upper limit, may be +inf.
+
+        Returns:
+            float: The integral of the CCDF over [a, b], negated if b < a.
+
+        Raises:
+            ValueError: If a limit is NaN.
+        """
+        if (a != a) or (b != b):
+            raise ValueError('cannot integrate between NaN limits')
+
+        if b == a:
+            return 0.
+
+        if b < a:
+            return -self.ccdfIntegral(b, a)
+
+        v: cdouble = b if b < self._value else self._value
+
+        return v - a if v > a else 0.
 
     def dcdf(self, k):
         """Not implemented: a degenerate distribution has no density.

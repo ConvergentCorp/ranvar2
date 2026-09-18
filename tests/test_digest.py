@@ -1,5 +1,6 @@
 import ranvar2 as mc
 import numpy as np
+import pytest
 import pickle
 import copy
 
@@ -355,6 +356,8 @@ def test_empty_digest_raises():
         ('ccdf()',         lambda: x.ccdf(5.0)),
         ('dcdf()',         lambda: x.dcdf(5.0)),
         ('dccdf()',        lambda: x.dccdf(5.0)),
+        ('cdfIntegral()',  lambda: x.cdfIntegral(1.0, 5.0)),
+        ('ccdfIntegral()', lambda: x.ccdfIntegral(1.0, 5.0)),
         ('quantile(0.0)',  lambda: x.quantile(0.0)),
         ('quantile(0.5)',  lambda: x.quantile(0.5)),
         ('quantile(1.0)',  lambda: x.quantile(1.0)),
@@ -460,3 +463,244 @@ def test_ladder_is_rebuilt_after_pickle_and_copy():
     for y in [pickle.loads(pickle.dumps(x)), copy.deepcopy(x)]:
         for p in [0.01, 0.1, 0.5, 0.9, 0.99]:
             assert y.quantile(p) == x.quantile(p), f'restored digest differs at p={p}'
+
+
+# cdfIntegral()/ccdfIntegral(): the areas under the two curves, read off the
+# centroids and weights rather than integrated numerically. Each is checked
+# against a midpoint rule over the very function it claims to integrate,
+# which assumes nothing about the shape of that function. ------------------
+
+def _midpointIntegral(f, a, b, n=200_000):
+    """Integrate f over [a, b] by the midpoint rule.
+
+    Deliberately naive: it only evaluates f, so it is a check on the
+    analytical integral rather than a restatement of it. Its own error is
+    the rule's, of order (b - a)/n at each jump in f, which the tolerances
+    below leave room for.
+    """
+    edges = np.linspace(a, b, n + 1)
+    mids  = 0.5*(edges[:-1] + edges[1:])
+    h     = (b - a) / n
+
+    return float(sum(f(float(m)) for m in mids) * h)
+
+
+def _integralWindows(d):
+    """A spread of limits over a digest: inside one segment, across several,
+    hanging off each end of the support, and the support itself."""
+    lo, hi = d.lower(), d.upper()
+    span   = hi - lo
+
+    return [
+        (lo, hi),
+        (lo - span, hi + span),
+        (lo + 0.1*span, lo + 0.4*span),
+        (lo + 0.37*span, hi - 0.11*span),
+        (lo - 2*span, lo + 0.25*span),
+        (hi - 0.25*span, hi + 3*span),
+    ]
+
+
+def _fittedDigest():
+    """A digest over enough points to have merged centroids of mixed weight."""
+    np.random.seed(31337)
+
+    x = mc.Digest(maxBins=32)
+    x.fit(np.random.randn(10_000)*100 + 100)
+
+    return x
+
+
+def _weightedDigest():
+    """A digest built by hand so that centroids of weight one sit next to
+    heavier ones, which is what drives the interpolation through all four of
+    its cases."""
+    x = mc.Digest(maxBins=32)
+
+    for point, count in [(0.0, 1.0), (1.0, 5.0), (2.5, 1.0),
+                         (4.0, 3.0), (7.0, 1.0), (9.0, 12.0)]:
+        x.add(point, count)
+
+    return x
+
+
+def _twoCentroidDigest():
+    """The smallest digest with an interior to integrate over."""
+    x = mc.Digest(maxBins=32)
+    x.add(2.0, 3.0)
+    x.add(8.0, 4.0)
+
+    return x
+
+
+def _unitDigest():
+    """Every centroid of weight one, which interpolates to a staircase."""
+    x = mc.Digest(maxBins=32)
+    x.fit([1, 2, 3, 4, 5])
+
+    return x
+
+
+def test_cdfIntegral_matches_a_numerical_integral():
+    """Tests cdfIntegral() against a midpoint rule over cdf() itself, on
+    digests covering all four interpolation cases.
+    """
+    for build in (_fittedDigest, _weightedDigest, _twoCentroidDigest, _unitDigest):
+        x = build()
+
+        for a, b in _integralWindows(x):
+            exact     = x.cdfIntegral(a, b)
+            numerical = _midpointIntegral(x.cdf, a, b)
+
+            assert abs(exact - numerical) <= 1e-5*(b - a) + 1e-9, \
+                f'{build.__name__} cdf over [{a}, {b}]: {exact} vs {numerical}'
+
+
+def test_ccdfIntegral_matches_a_numerical_integral():
+    """Tests ccdfIntegral() the same way, against a midpoint rule over
+    ccdf().
+    """
+    for build in (_fittedDigest, _weightedDigest, _twoCentroidDigest, _unitDigest):
+        x = build()
+
+        for a, b in _integralWindows(x):
+            exact     = x.ccdfIntegral(a, b)
+            numerical = _midpointIntegral(x.ccdf, a, b)
+
+            assert abs(exact - numerical) <= 1e-5*(b - a) + 1e-9, \
+                f'{build.__name__} ccdf over [{a}, {b}]: {exact} vs {numerical}'
+
+
+def test_integrals_of_the_two_curves_add_up_to_the_width():
+    """Tests that the two areas partition the rectangle over [a, b], since
+    the curves sum to 1 everywhere.
+    """
+    x = _fittedDigest()
+
+    for a, b in _integralWindows(x):
+        total = x.cdfIntegral(a, b) + x.ccdfIntegral(a, b)
+
+        assert abs(total - (b - a)) <= 1e-9*(b - a)
+
+
+def test_integrals_are_additive_over_adjacent_windows():
+    """Tests that splitting a window anywhere, including exactly on a
+    centroid, splits the area with it.
+    """
+    x = _weightedDigest()
+
+    lo, hi = x.lower(), x.upper()
+
+    for m in (lo, 1.0, 2.5, 3.3, 7.0, hi, hi + 1.0):
+        a, b = lo - 2.0, hi + 2.0
+
+        assert x.cdfIntegral(a, b) == pytest.approx(
+            x.cdfIntegral(a, m) + x.cdfIntegral(m, b), abs=1e-12)
+        assert x.ccdfIntegral(a, b) == pytest.approx(
+            x.ccdfIntegral(a, m) + x.ccdfIntegral(m, b), abs=1e-12)
+
+
+def test_integrals_of_an_empty_window_and_reversed_limits():
+    """Tests the two conventions every integral follows: no width, no area,
+    and swapping the limits negates it.
+    """
+    x = _weightedDigest()
+
+    assert x.cdfIntegral(3.0, 3.0)  == 0.0
+    assert x.ccdfIntegral(3.0, 3.0) == 0.0
+
+    assert x.cdfIntegral(6.0, 2.0)  == -x.cdfIntegral(2.0, 6.0)
+    assert x.ccdfIntegral(6.0, 2.0) == -x.ccdfIntegral(2.0, 6.0)
+
+
+def test_integrals_outside_the_support_are_flat():
+    """Tests the two tails: the CDF contributes nothing below the support
+    and the full width above it, and the CCDF the other way around.
+    """
+    x = _weightedDigest()
+
+    lo, hi = x.lower(), x.upper()
+
+    assert x.cdfIntegral(lo - 7.0, lo)  == 0.0
+    assert x.ccdfIntegral(hi, hi + 7.0) == 0.0
+
+    assert x.cdfIntegral(hi, hi + 7.0) == pytest.approx(7.0)
+    assert x.ccdfIntegral(lo - 7.0, lo) == pytest.approx(7.0)
+
+
+def test_integrals_accept_the_unbounded_side():
+    """Tests that the limit the curve is zero towards may be infinite, and
+    that the other one reports an infinite area rather than a finite wrong
+    answer.
+    """
+    x = _fittedDigest()
+
+    lo, hi = x.lower(), x.upper()
+    span   = hi - lo
+
+    # Far enough out that nothing is left to accumulate, so the infinite
+    # limit has to agree with it.
+    assert x.cdfIntegral(float('-inf'), hi) == pytest.approx(x.cdfIntegral(lo - 1e3*span, hi))
+    assert x.ccdfIntegral(lo, float('inf')) == pytest.approx(x.ccdfIntegral(lo, hi + 1e3*span))
+
+    assert x.cdfIntegral(lo, float('inf'))  == float('inf')
+    assert x.ccdfIntegral(float('-inf'), hi) == float('inf')
+
+
+def test_integrals_of_the_ccdf_give_the_mean_of_the_interpolated_curve():
+    """Tests the identity E[X] = lower + integral of the CCDF over the whole
+    support, against a mean taken from the same interpolated curve by its
+    quantiles.
+
+    The digest's own mean() is the mean of the data added to it, which the
+    interpolated curve need not reproduce exactly, so the reference here is
+    the curve rather than mean().
+    """
+    x = _fittedDigest()
+
+    lo = x.lower()
+
+    fromIntegral = lo + x.ccdfIntegral(lo, float('inf'))
+
+    # The mean as the average quantile, which is the same integral taken in
+    # the other variable and shares none of its code.
+    ps           = (np.arange(200_000) + 0.5) / 200_000
+    fromQuantile = float(np.mean([x.quantile(float(p)) for p in ps]))
+
+    assert fromIntegral == pytest.approx(fromQuantile, rel=1e-4)
+
+
+def test_integrals_reject_nan_limits():
+    """Tests that a NaN limit is refused rather than quietly returning NaN."""
+    x = _weightedDigest()
+
+    nan = float('nan')
+
+    for call in (lambda: x.cdfIntegral(nan, 1.0),
+                 lambda: x.cdfIntegral(1.0, nan),
+                 lambda: x.ccdfIntegral(nan, 1.0),
+                 lambda: x.ccdfIntegral(1.0, nan)):
+        try:
+            call()
+        except ValueError:
+            pass
+        else:
+            assert False, 'a NaN limit should raise ValueError'
+
+
+def test_integrals_of_a_single_centroid_digest():
+    """Tests the degenerate digest, which has no segment to interpolate
+    over: its CDF is a single step at the one centroid, so the area is
+    whatever of the window lies on the right side of it.
+    """
+    x = mc.Digest(maxBins=32)
+    x.add(4.0, 3.0)
+
+    assert x.cdfIntegral(0.0, 10.0)  == pytest.approx(6.0)
+    assert x.ccdfIntegral(0.0, 10.0) == pytest.approx(4.0)
+
+    assert x.cdfIntegral(0.0, 10.0)  == pytest.approx(_midpointIntegral(x.cdf, 0.0, 10.0),  abs=1e-4)
+    assert x.ccdfIntegral(0.0, 10.0) == pytest.approx(_midpointIntegral(x.ccdf, 0.0, 10.0), abs=1e-4)
+
+    assert x.cdfIntegral(float('-inf'), 4.0) == 0.0
+    assert x.ccdfIntegral(4.0, float('inf')) == 0.0

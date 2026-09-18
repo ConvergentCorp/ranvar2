@@ -89,6 +89,9 @@ x.mean()          # the exact weighted mean of what was added
 x.quantile(0.5)   # the median, interpolated from the digest
 x.sample()        # ~x: one draw from the fitted distribution
 x.cdf(100)        # P(X <= 100)
+
+x.cdfIntegral(90, 110)             # the exact area under the CDF over [90, 110]
+x.ccdfIntegral(100, float('inf'))  # the exact area under the CCDF from 100 up
 ```
 
 ### `@func`: an interpreted Monte Carlo model
@@ -178,9 +181,9 @@ counts: `fit(x)` takes its value from the sample mean of as little as one
 point, and `add(point)` replaces the value outright, since one point does
 fully determine a constant. Methods with no closed form in terms of standard
 C `math.h` functions (`Normal.quantile()`,
-`NegBinom.cdf()`/`ccdf()`/`dcdf()`/`dccdf()`/`quantile()`) raise
-`NotImplementedError` rather than silently reading an unrelated digest, as do
-`Constant.dcdf()`/`dccdf()`, whose CDF is a step with no density.
+`NegBinom.cdf()`/`ccdf()`/`cdfIntegral()`/`ccdfIntegral()`/`dcdf()`/`dccdf()`/`quantile()`)
+raise `NotImplementedError` rather than silently reading an unrelated digest,
+as do `Constant.dcdf()`/`dccdf()`, whose CDF is a step with no density.
 
 ### `RanVarArray`: a collection of digests
 

@@ -647,8 +647,8 @@ def test_asranvar_output_runs_in_a_compiled_model():
 # any of these subclasses. ------------------------------------------------
 
 PUBLIC_METHODS = [
-    'add', 'lower', 'upper', 'cdf', 'ccdf', 'dcdf', 'dccdf', 'quantile',
-    'sample', 'mean', 'fit',
+    'add', 'lower', 'upper', 'cdf', 'ccdf', 'cdfIntegral', 'ccdfIntegral',
+    'dcdf', 'dccdf', 'quantile', 'sample', 'mean', 'fit',
 ]
 
 
@@ -663,3 +663,161 @@ def test_all_public_ranvar_methods_are_present(cls, kwargs):
 
     for name in PUBLIC_METHODS:
         assert hasattr(instance, name), f'{cls.__name__} is missing {name}()'
+
+
+# cdfIntegral()/ccdfIntegral() on the analytical distributions: closed forms
+# where there is one, and a refusal where there is not. Each is checked
+# against a midpoint rule over the distribution's own cdf()/ccdf(). --------
+
+def _midpointIntegral(f, a, b, n=200_000):
+    """Integrate f over [a, b] by the midpoint rule, evaluating f and
+    nothing else, so it checks the analytical integral rather than
+    restating it."""
+    edges = np.linspace(a, b, n + 1)
+    mids  = 0.5*(edges[:-1] + edges[1:])
+    h     = (b - a) / n
+
+    return float(sum(f(float(m)) for m in mids) * h)
+
+
+@pytest.mark.parametrize('a, b', [
+    (-5.0, 11.0),
+    (3.0, 7.0),
+    (-20.0, 3.0),
+    (2.9, 3.1),
+    (7.0, 40.0),
+])
+def test_normal_integrals_match_a_numerical_integral(a, b):
+    """Tests Normal's closed-form integrals against a midpoint rule over its
+    own cdf()/ccdf().
+    """
+    n = Normal(mean=3.0, std=2.0)
+
+    assert n.cdfIntegral(a, b)  == pytest.approx(_midpointIntegral(n.cdf, a, b),  abs=1e-9*(b - a) + 1e-12)
+    assert n.ccdfIntegral(a, b) == pytest.approx(_midpointIntegral(n.ccdf, a, b), abs=1e-9*(b - a) + 1e-12)
+
+
+def test_normal_integrals_match_their_closed_forms():
+    """Tests the two integrals against values the normal distribution has
+    in closed form: the area under the CDF up to the mean is std/sqrt(2*pi),
+    the two curves are mirror images about the mean, and they partition the
+    rectangle over any window.
+    """
+    n = Normal(mean=3.0, std=2.0)
+
+    expected = 2.0 / math.sqrt(2*math.pi)
+
+    assert n.cdfIntegral(float('-inf'), 3.0) == pytest.approx(expected)
+    assert n.ccdfIntegral(3.0, float('inf')) == pytest.approx(expected)
+
+    # Symmetric about the mean: the area under the CDF below it equals the
+    # area under the CCDF above it, window for window.
+    for d in (0.5, 2.0, 9.0):
+        assert n.cdfIntegral(3.0 - d, 3.0) == pytest.approx(n.ccdfIntegral(3.0, 3.0 + d))
+
+    for a, b in [(-5.0, 11.0), (3.0, 7.0), (-20.0, 3.0)]:
+        assert n.cdfIntegral(a, b) + n.ccdfIntegral(a, b) == pytest.approx(b - a)
+
+
+def test_normal_integrals_handle_the_unbounded_side_and_reversed_limits():
+    """Tests that the infinite limit each curve decays towards is answered,
+    the other one is infinite, and the usual integral conventions hold.
+    """
+    n = Normal(mean=0.0, std=1.0)
+
+    assert n.cdfIntegral(1.0, float('inf'))   == float('inf')
+    assert n.ccdfIntegral(float('-inf'), 1.0) == float('inf')
+
+    assert n.cdfIntegral(2.0, 2.0)  == 0.0
+    assert n.ccdfIntegral(2.0, 2.0) == 0.0
+
+    assert n.cdfIntegral(3.0, -1.0)  == -n.cdfIntegral(-1.0, 3.0)
+    assert n.ccdfIntegral(3.0, -1.0) == -n.ccdfIntegral(-1.0, 3.0)
+
+
+def test_normal_ccdf_integral_gives_the_mean_absolute_deviation():
+    """Tests the two integrals against the mean absolute deviation of a
+    normal, std*sqrt(2/pi), which they have to add up to since
+    E|X - mean| is the area under the CDF below the mean plus the area
+    under the CCDF above it.
+    """
+    n = Normal(mean=-4.0, std=3.0)
+
+    mad = n.cdfIntegral(float('-inf'), -4.0) + n.ccdfIntegral(-4.0, float('inf'))
+
+    assert mad == pytest.approx(3.0 * math.sqrt(2/math.pi))
+
+
+@pytest.mark.parametrize('method', ['cdfIntegral', 'ccdfIntegral'])
+def test_normal_integrals_reject_nan_limits(method):
+    """Tests that a NaN limit is refused rather than quietly returning NaN."""
+    n = Normal(mean=0.0, std=1.0)
+
+    with pytest.raises(ValueError):
+        getattr(n, method)(float('nan'), 1.0)
+
+    with pytest.raises(ValueError):
+        getattr(n, method)(1.0, float('nan'))
+
+
+@pytest.mark.parametrize('method', ['cdfIntegral', 'ccdfIntegral'])
+def test_negbinom_integrals_are_not_implemented(method):
+    """Tests that the integrals refuse for the same reason cdf() does,
+    rather than falling through to RanVar's read of the (empty) inherited
+    digest.
+    """
+    nb = NegBinom(mean=5.0, dispersion=1.0)
+
+    with pytest.raises(NotImplementedError):
+        getattr(nb, method)(0.0, 10.0)
+
+
+@pytest.mark.parametrize('a, b', [
+    (0.0, 10.0),
+    (0.0, 5.0),
+    (5.0, 10.0),
+    (6.0, 9.0),
+    (0.0, 4.0),
+    (4.5, 5.5),
+])
+def test_constant_integrals_are_the_area_of_the_step(a, b):
+    """Tests Constant's integrals against a midpoint rule over its own step
+    cdf()/ccdf().
+    """
+    c = Constant(value=5.0)
+
+    assert c.cdfIntegral(a, b)  == pytest.approx(_midpointIntegral(c.cdf, a, b),  abs=1e-4)
+    assert c.ccdfIntegral(a, b) == pytest.approx(_midpointIntegral(c.ccdf, a, b), abs=1e-4)
+
+    # The step puts the whole area on one side of the value.
+    assert c.cdfIntegral(a, b)  == pytest.approx(max(0.0, b - max(a, 5.0)))
+    assert c.ccdfIntegral(a, b) == pytest.approx(max(0.0, min(b, 5.0) - a))
+
+
+def test_constant_integrals_handle_infinities_and_reversed_limits():
+    """Tests the unbounded sides and the usual integral conventions."""
+    c = Constant(value=5.0)
+
+    assert c.ccdfIntegral(5.0, float('inf'))  == 0.0
+    assert c.cdfIntegral(float('-inf'), 5.0)  == 0.0
+
+    assert c.cdfIntegral(5.0, float('inf'))   == float('inf')
+    assert c.ccdfIntegral(float('-inf'), 5.0) == float('inf')
+
+    assert c.cdfIntegral(7.0, 7.0)  == 0.0
+    assert c.ccdfIntegral(7.0, 7.0) == 0.0
+
+    assert c.cdfIntegral(9.0, 1.0)  == -c.cdfIntegral(1.0, 9.0)
+    assert c.ccdfIntegral(9.0, 1.0) == -c.ccdfIntegral(1.0, 9.0)
+
+
+@pytest.mark.parametrize('method', ['cdfIntegral', 'ccdfIntegral'])
+def test_constant_integrals_reject_nan_limits(method):
+    """Tests that a NaN limit is refused rather than quietly returning NaN."""
+    c = Constant(value=5.0)
+
+    with pytest.raises(ValueError):
+        getattr(c, method)(float('nan'), 1.0)
+
+    with pytest.raises(ValueError):
+        getattr(c, method)(1.0, float('nan'))
