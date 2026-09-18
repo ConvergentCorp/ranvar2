@@ -647,27 +647,90 @@ def test_integrals_accept_the_unbounded_side():
     assert x.ccdfIntegral(float('-inf'), hi) == float('inf')
 
 
-def test_integrals_of_the_ccdf_give_the_mean_of_the_interpolated_curve():
-    """Tests the identity E[X] = lower + integral of the CCDF over the whole
-    support, against a mean taken from the same interpolated curve by its
-    quantiles.
+def _interpolatedMean(x):
+    """The mean of the curve cdf() describes, taken as a first moment.
+
+    Decomposes the interpolated distribution into the mass each segment
+    spreads uniformly and the mass each jump puts on a single point, then
+    sums x*mass over both. That is the other route to the mean: the
+    integrals under test take the area under the survival function instead,
+    so the two share the interpolation convention and nothing else.
+
+    The jumps are the part that matters here. The curve leaps at c[0], at
+    any centroid where a neighbouring weight is one, and at the top where it
+    is clamped to 1, and a mean that came out right could only do so if
+    every one of those is carried at the right point.
+    """
+    c = np.asarray(x.getBins(), dtype=float)
+    m = np.asarray(x.getWeights(), dtype=float)
+
+    n = len(c)
+    W = m.sum()
+
+    if n == 1:
+        return float(c[0])
+
+    def bounds(i):
+        som = m[:i].sum()
+
+        if (m[i] > 1) and (m[i+1] > 1):
+            yi = som + m[i]/2
+            yin = yi + (m[i+1] + m[i])/2
+        elif (m[i] == 1) and (m[i+1] > 1):
+            yi = som
+            yin = yi + m[i+1]/2
+        elif (m[i] > 1) and (m[i+1] == 1):
+            yi = som + m[i]/2
+            yin = yi + m[i]/2
+        else:
+            yi = som
+            yin = som
+
+        return yi, yin
+
+    total   = 0.0
+    prevTop = 0.0
+
+    for i in range(n - 1):
+        yi, yin = bounds(i)
+
+        # The jump at c[i]: mass the curve gains at the point itself.
+        total += c[i] * (yi - prevTop)/W
+
+        # The segment: mass spread evenly, so it sits at the midpoint.
+        total += (yin - yi)/W * (c[i] + c[i+1])/2
+
+        prevTop = yin
+
+    # The jump at the top, where cdf() clamps to 1.
+    total += c[n-1] * (W - prevTop)/W
+
+    return float(total)
+
+
+@pytest.mark.parametrize('build', [
+    _fittedDigest, _weightedDigest, _twoCentroidDigest, _unitDigest,
+])
+def test_integrals_of_the_ccdf_give_the_mean_of_the_interpolated_curve(build):
+    """Tests the identity E[X] = lower + the integral of the CCDF over the
+    whole support, against the same curve's first moment.
+
+    This is what pins down the ends: the identity only holds if the area
+    accounts for every jump, including the one at the bottom centroid and
+    the one at the top where the curve is clamped, so a tail dropped or
+    counted twice shows up here as a shifted mean rather than as a small
+    numerical residual.
 
     The digest's own mean() is the mean of the data added to it, which the
-    interpolated curve need not reproduce exactly, so the reference here is
-    the curve rather than mean().
+    interpolated curve need not reproduce exactly, so the reference is the
+    curve rather than mean().
     """
-    x = _fittedDigest()
+    x = build()
 
     lo = x.lower()
 
-    fromIntegral = lo + x.ccdfIntegral(lo, float('inf'))
-
-    # The mean as the average quantile, which is the same integral taken in
-    # the other variable and shares none of its code.
-    ps           = (np.arange(200_000) + 0.5) / 200_000
-    fromQuantile = float(np.mean([x.quantile(float(p)) for p in ps]))
-
-    assert fromIntegral == pytest.approx(fromQuantile, rel=1e-4)
+    assert lo + x.ccdfIntegral(lo, float('inf')) == pytest.approx(
+        _interpolatedMean(x), rel=1e-12)
 
 
 def test_integrals_reject_nan_limits():
@@ -704,3 +767,159 @@ def test_integrals_of_a_single_centroid_digest():
 
     assert x.cdfIntegral(float('-inf'), 4.0) == 0.0
     assert x.ccdfIntegral(4.0, float('inf')) == 0.0
+
+
+# The two extreme centroids, where a weight of one means the interpolation
+# takes its Case II/III branch on the very first or very last segment. Those
+# are the segments that meet the clamped ends of the CDF, so they are the
+# ones where an integral can lose or double count a tail. ------------------
+
+ENDPOINT_WEIGHTS = [
+    ('both ends singleton', [(0., 1.), (1., 5.), (2.5, 1.), (4., 3.), (7., 1.)]),
+    ('only the first',      [(0., 1.), (1., 5.), (2.5, 1.), (4., 3.), (7., 9.)]),
+    ('only the last',       [(0., 4.), (1., 5.), (2.5, 1.), (4., 3.), (7., 1.)]),
+    ('neither',             [(0., 4.), (1., 5.), (2.5, 1.), (4., 3.), (7., 9.)]),
+    ('every centroid',      [(0., 1.), (1., 1.), (2.5, 1.), (4., 1.), (7., 1.)]),
+]
+
+
+def _endpointDigest(spec):
+    x = mc.Digest(maxBins=32)
+
+    for point, count in spec:
+        x.add(point, count)
+
+    return x
+
+
+@pytest.mark.parametrize('name, spec', ENDPOINT_WEIGHTS)
+def test_integrals_with_singleton_endpoints(name, spec):
+    """Tests both integrals against a numerical one on digests whose first
+    and last centroids carry a weight of one, in every combination.
+
+    A singleton at an end drives the interpolation of the first or last
+    segment through a different case than its neighbours, so these are the
+    digests where the segment walk and the flat tail outside the support
+    have to agree on where the support ends.
+    """
+    x = _endpointDigest(spec)
+
+    lo, hi = x.lower(), x.upper()
+
+    windows = [
+        (lo, hi),
+        (lo - 3.0, hi + 3.0),
+        (lo, lo + 0.5),
+        (hi - 0.5, hi),
+        (lo - 3.0, lo + 0.25),
+        (hi - 0.25, hi + 3.0),
+    ]
+
+    for a, b in windows:
+        assert x.cdfIntegral(a, b) == pytest.approx(
+            _midpointIntegral(x.cdf, a, b), abs=1e-4), f'{name} cdf over [{a}, {b}]'
+        assert x.ccdfIntegral(a, b) == pytest.approx(
+            _midpointIntegral(x.ccdf, a, b), abs=1e-4), f'{name} ccdf over [{a}, {b}]'
+
+
+@pytest.mark.parametrize('name, spec', ENDPOINT_WEIGHTS)
+def test_integrals_continue_flat_past_a_singleton_endpoint(name, spec):
+    """Tests that the area does not step at either end of the support.
+
+    Past the top the CDF is 1, so widening the window there adds exactly the
+    width it adds and nothing else; below the bottom the CCDF is 1 and the
+    same holds. Whatever mass the interpolation leaves for the jump at an
+    end, the integral has to join the flat tail to the segment walk without
+    a seam, and a singleton endpoint jumps by a different amount than a
+    heavy one.
+    """
+    x = _endpointDigest(spec)
+
+    lo, hi = x.lower(), x.upper()
+
+    for d in (1e-6, 0.25, 4.0):
+        assert x.cdfIntegral(lo, hi + d) == pytest.approx(
+            x.cdfIntegral(lo, hi) + d, abs=1e-12)
+        assert x.ccdfIntegral(lo - d, hi) == pytest.approx(
+            x.ccdfIntegral(lo, hi) + d, abs=1e-12)
+
+        # And from the other side: a window wholly outside the support is
+        # all of one curve and none of the other.
+        assert x.cdfIntegral(hi, hi + d)  == pytest.approx(d, abs=1e-12)
+        assert x.ccdfIntegral(lo - d, lo) == pytest.approx(d, abs=1e-12)
+        assert x.cdfIntegral(lo - d, lo)  == 0.0
+        assert x.ccdfIntegral(hi, hi + d) == 0.0
+
+
+@pytest.mark.parametrize('name, spec', ENDPOINT_WEIGHTS)
+def test_integrals_split_exactly_on_the_endpoints(name, spec):
+    """Tests that splitting a window at either end of the support splits the
+    area with it, which is where a tail counted twice or not at all would
+    show up.
+    """
+    x = _endpointDigest(spec)
+
+    lo, hi = x.lower(), x.upper()
+    a, b   = lo - 2.0, hi + 2.0
+
+    for m in (lo, hi):
+        assert x.cdfIntegral(a, b) == pytest.approx(
+            x.cdfIntegral(a, m) + x.cdfIntegral(m, b), abs=1e-12)
+        assert x.ccdfIntegral(a, b) == pytest.approx(
+            x.ccdfIntegral(a, m) + x.ccdfIntegral(m, b), abs=1e-12)
+
+    assert x.cdfIntegral(a, b) + x.ccdfIntegral(a, b) == pytest.approx(b - a)
+
+
+def test_a_singleton_top_centroid_carries_exactly_its_own_weight():
+    """Tests the convention the integrals inherit from cdf() at the top of
+    the support: a last centroid of weight one is a single observation
+    sitting exactly on that point, so the interpolated curve reaches
+    1 - 1/W just below it and the remaining 1/W is the jump at the point
+    itself.
+
+    The area is what the curve leaves, so ccdfIntegral() over a sliver below
+    the top has to measure that 1/W rather than the half weight a heavier
+    centroid would leave there.
+    """
+    x = _endpointDigest([(0., 4.), (1., 5.), (2.5, 1.), (4., 3.), (7., 1.)])
+
+    hi = x.upper()
+    W  = float(sum(x.getWeights()))
+
+    assert 1.0 - x.cdf(hi - 1e-9) == pytest.approx(1.0/W, rel=1e-6)
+
+    # Over a sliver the curve is near enough constant, so the area is the
+    # sliver's width times that remaining weight.
+    d = 1e-6
+
+    assert x.ccdfIntegral(hi - d, hi) == pytest.approx(d/W, rel=1e-3)
+
+
+@pytest.mark.parametrize('name, spec', ENDPOINT_WEIGHTS)
+def test_singleton_endpoints_carry_their_mass_into_the_area(name, spec):
+    """Tests the mean identity on each endpoint configuration.
+
+    The area under the CCDF over the whole support is E[X] - lower, and the
+    mass at the two ends is exactly what a singleton there changes: a first
+    or last centroid of weight one shifts the curve's jumps, and any of that
+    mass the area failed to carry would move the mean it implies. Matching
+    the curve's own first moment to the last bits rules that out.
+    """
+    x = _endpointDigest(spec)
+
+    lo = x.lower()
+
+    assert lo + x.ccdfIntegral(lo, float('inf')) == pytest.approx(
+        _interpolatedMean(x), rel=1e-12)
+
+
+def test_a_single_centroid_carries_its_mass_into_the_area():
+    """Tests the same identity on the digest with no interior at all, where
+    the whole distribution is one atom and the area is the flat tail alone.
+    """
+    x = mc.Digest(maxBins=32)
+    x.add(4.0, 3.0)
+
+    assert x.lower() + x.ccdfIntegral(x.lower(), float('inf')) == pytest.approx(
+        _interpolatedMean(x), rel=1e-12)
