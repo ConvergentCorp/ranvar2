@@ -33,7 +33,7 @@ cdef class RanVar:
     cpdef double _lower(self)
     cpdef double _upper(self)
     cdef double _sumWeights(self)
-    cdef _interpolationBounds(self, int i, double som)
+    cdef int _findSegment(self, double k)
     cdef void _rebuildLadder(self)
     cpdef double quantile(self, double p)
     cpdef double sample(self)

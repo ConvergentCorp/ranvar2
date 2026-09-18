@@ -88,7 +88,7 @@ x.fit([95, 100, 105, 98, 102, 110, 90, 100, 101, 99])
 x.mean()          # the exact weighted mean of what was added
 x.quantile(0.5)   # the median, interpolated from the digest
 x.sample()        # ~x: one draw from the fitted distribution
-x.cdf(100)        # P(X <= 100)
+x.cdf(100)        # P(X <= 100), the exact inverse of quantile()
 
 x.cdfIntegral(90, 110)             # the exact area under the CDF over [90, 110]
 x.ccdfIntegral(100, float('inf'))  # the exact area under the CCDF from 100 up

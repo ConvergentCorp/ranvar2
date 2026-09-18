@@ -650,16 +650,15 @@ def test_integrals_accept_the_unbounded_side():
 def _interpolatedMean(x):
     """The mean of the curve cdf() describes, taken as a first moment.
 
-    Decomposes the interpolated distribution into the mass each segment
-    spreads uniformly and the mass each jump puts on a single point, then
-    sums x*mass over both. That is the other route to the mean: the
-    integrals under test take the area under the survival function instead,
-    so the two share the interpolation convention and nothing else.
+    Rebuilds the cumulative weight ladder from the centroids and weights the
+    way _rebuildLadder() defines it, then sums mass times position over the
+    segments. The curve is continuous, so every segment spreads its weight
+    evenly and sits at its own midpoint, and there is no mass on any single
+    point to account for separately.
 
-    The jumps are the part that matters here. The curve leaps at c[0], at
-    any centroid where a neighbouring weight is one, and at the top where it
-    is clamped to 1, and a mean that came out right could only do so if
-    every one of those is carried at the right point.
+    That is the other route to the mean: the integrals under test take the
+    area under the survival function instead, so the two share the ladder
+    and nothing else.
     """
     c = np.asarray(x.getBins(), dtype=float)
     m = np.asarray(x.getWeights(), dtype=float)
@@ -670,42 +669,16 @@ def _interpolatedMean(x):
     if n == 1:
         return float(c[0])
 
-    def bounds(i):
-        som = m[:i].sum()
-
-        if (m[i] > 1) and (m[i+1] > 1):
-            yi = som + m[i]/2
-            yin = yi + (m[i+1] + m[i])/2
-        elif (m[i] == 1) and (m[i+1] > 1):
-            yi = som
-            yin = yi + m[i+1]/2
-        elif (m[i] > 1) and (m[i+1] == 1):
-            yi = som + m[i]/2
-            yin = yi + m[i]/2
-        else:
-            yi = som
-            yin = som
-
-        return yi, yin
-
-    total   = 0.0
-    prevTop = 0.0
-
+    # An outer centroid gives its whole weight to its only segment, an
+    # interior one half to each side.
+    gaps = []
     for i in range(n - 1):
-        yi, yin = bounds(i)
+        gap  = m[i] if i == 0 else m[i]/2
+        gap += m[i+1] if i == n - 2 else m[i+1]/2
 
-        # The jump at c[i]: mass the curve gains at the point itself.
-        total += c[i] * (yi - prevTop)/W
+        gaps.append(gap)
 
-        # The segment: mass spread evenly, so it sits at the midpoint.
-        total += (yin - yi)/W * (c[i] + c[i+1])/2
-
-        prevTop = yin
-
-    # The jump at the top, where cdf() clamps to 1.
-    total += c[n-1] * (W - prevTop)/W
-
-    return float(total)
+    return float(sum(gaps[i]/W * (c[i] + c[i+1])/2 for i in range(n - 1)))
 
 
 @pytest.mark.parametrize('build', [
@@ -871,29 +844,38 @@ def test_integrals_split_exactly_on_the_endpoints(name, spec):
     assert x.cdfIntegral(a, b) + x.ccdfIntegral(a, b) == pytest.approx(b - a)
 
 
-def test_a_singleton_top_centroid_carries_exactly_its_own_weight():
-    """Tests the convention the integrals inherit from cdf() at the top of
-    the support: a last centroid of weight one is a single observation
-    sitting exactly on that point, so the interpolated curve reaches
-    1 - 1/W just below it and the remaining 1/W is the jump at the point
-    itself.
+@pytest.mark.parametrize('name, spec', ENDPOINT_WEIGHTS)
+def test_no_mass_sits_on_an_endpoint(name, spec):
+    """Tests that the curve meets the ends of its support continuously,
+    whatever the extreme centroids weigh.
 
-    The area is what the curve leaves, so ccdfIntegral() over a sliver below
-    the top has to measure that 1/W rather than the half weight a heavier
-    centroid would leave there.
+    A jump at an end would be mass sitting on a single point, which is the
+    one thing the area under the curve cannot see and quantile() cannot
+    reproduce. So the CDF has to reach 0 at the bottom centroid and 1 at the
+    top one, not merely be clamped there.
     """
-    x = _endpointDigest([(0., 4.), (1., 5.), (2.5, 1.), (4., 3.), (7., 1.)])
+    x = _endpointDigest(spec)
 
-    hi = x.upper()
-    W  = float(sum(x.getWeights()))
+    lo, hi = x.lower(), x.upper()
 
-    assert 1.0 - x.cdf(hi - 1e-9) == pytest.approx(1.0/W, rel=1e-6)
+    for d in (1e-6, 1e-9):
+        assert x.cdf(lo + d) == pytest.approx(0.0, abs=1e-4)
+        assert x.cdf(hi - d) == pytest.approx(1.0, abs=1e-4)
 
-    # Over a sliver the curve is near enough constant, so the area is the
-    # sliver's width times that remaining weight.
-    d = 1e-6
 
-    assert x.ccdfIntegral(hi - d, hi) == pytest.approx(d/W, rel=1e-3)
+@pytest.mark.parametrize('name, spec', ENDPOINT_WEIGHTS)
+def test_no_mass_sits_on_an_interior_centroid(name, spec):
+    """Tests the same at every centroid in between, where a weight of one
+    used to put the two neighbouring segments at odds with each other.
+    """
+    x = _endpointDigest(spec)
+
+    bins = x.getBins()
+
+    for c in bins[1:-1]:
+        d = 1e-7
+
+        assert x.cdf(float(c) + d) == pytest.approx(x.cdf(float(c) - d), abs=1e-6)
 
 
 @pytest.mark.parametrize('name, spec', ENDPOINT_WEIGHTS)
@@ -923,3 +905,102 @@ def test_a_single_centroid_carries_its_mass_into_the_area():
 
     assert x.lower() + x.ccdfIntegral(x.lower(), float('inf')) == pytest.approx(
         _interpolatedMean(x), rel=1e-12)
+
+
+# cdf() and quantile() read one ladder, so they describe one distribution.
+# They used to disagree: quantile() gave an outer centroid its whole weight
+# across its only segment, while cdf() gave it half and left the rest as a
+# jump, which put the two as far as 0.4 apart in probability on a small
+# digest. ------------------------------------------------------------------
+
+ALL_DIGESTS = [
+    ('fitted',         _fittedDigest),
+    ('weighted',       _weightedDigest),
+    ('two centroids',  _twoCentroidDigest),
+    ('unit weights',   _unitDigest),
+] + [(name, lambda spec=spec: _endpointDigest(spec)) for name, spec in ENDPOINT_WEIGHTS]
+
+
+@pytest.mark.parametrize('name, build', ALL_DIGESTS)
+def test_cdf_inverts_quantile(name, build):
+    """Tests that cdf() undoes quantile() exactly, across the whole
+    probability range and on every shape of digest.
+
+    This is what it means for the two to describe one distribution. It is an
+    equality rather than an approximation: both read the same rungs, so the
+    weight quantile() spreads across a segment is the weight cdf() finds
+    there.
+    """
+    x = build()
+
+    for p in np.linspace(0.001, 0.999, 999):
+        assert x.cdf(x.quantile(float(p))) == pytest.approx(float(p), abs=1e-12), \
+            f'{name} at p={p}'
+
+
+@pytest.mark.parametrize('name, build', ALL_DIGESTS)
+def test_quantile_inverts_cdf(name, build):
+    """Tests the round trip the other way, from a point in the support back
+    to itself, which pins the two together at the ends of each segment as
+    well as inside it.
+    """
+    x = build()
+
+    lo, hi = x.lower(), x.upper()
+
+    for f in np.linspace(0.0, 1.0, 101):
+        k = lo + f*(hi - lo)
+
+        assert x.quantile(x.cdf(k)) == pytest.approx(k, abs=1e-9*(hi - lo) + 1e-12), \
+            f'{name} at k={k}'
+
+
+@pytest.mark.parametrize('name, build', ALL_DIGESTS)
+def test_cdf_agrees_with_the_ladder_at_every_centroid(name, build):
+    """Tests cdf() against the cumulative weight at each centroid, worked
+    out from the weights alone.
+
+    An outer centroid gives its whole weight to its only segment and an
+    interior one half to each side, which is the rule quantile()'s ladder
+    follows and the one cdf() used to break at the two ends.
+    """
+    x = build()
+
+    c = x.getBins()
+    m = x.getWeights()
+
+    n = len(c)
+    W = float(sum(m))
+
+    if n == 1:
+        return
+
+    cum = 0.0
+
+    for i in range(n - 1):
+        assert x.cdf(float(c[i])) == pytest.approx(cum/W, abs=1e-12), \
+            f'{name} at centroid {i}'
+
+        gap  = m[i] if i == 0 else m[i]/2
+        gap += m[i+1] if i == n - 2 else m[i+1]/2
+
+        cum += gap
+
+    assert cum == pytest.approx(W)
+    assert x.cdf(float(c[n-1])) == 1.0
+
+
+@pytest.mark.parametrize('name, build', ALL_DIGESTS)
+def test_density_integrates_to_the_cdf(name, build):
+    """Tests that dcdf() is the gradient of the very curve cdf() reads, by
+    integrating the density back into the CDF numerically.
+    """
+    x = build()
+
+    lo, hi = x.lower(), x.upper()
+
+    for f in (0.25, 0.5, 0.9):
+        k = lo + f*(hi - lo)
+
+        assert _midpointIntegral(x.dcdf, lo, k, 100_000) == pytest.approx(
+            x.cdf(k), abs=1e-4), f'{name} at k={k}'

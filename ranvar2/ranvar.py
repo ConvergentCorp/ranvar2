@@ -55,6 +55,12 @@ class RanVar():
     cached and searched rather than rebuilt on every call, which is what makes
     repeated sampling from a fitted digest cheap.
 
+    cdf(), dcdf() and the two integrals read that same ladder, so every view
+    of the digest describes one distribution: the piecewise-linear curve
+    through the rungs. cdf() is quantile()'s exact inverse, dcdf() is that
+    curve's gradient, and cdfIntegral()/ccdfIntegral() are the areas under
+    it.
+
     Attributes:
         bins (np.ndarray): Array storing centroid values (x-coordinates)
         cnts (np.ndarray): Array storing centroid weights (counts)
@@ -319,43 +325,34 @@ class RanVar():
     @wraparound(False)
     @cdivision(True)
     @initializedcheck(False)
-    def _interpolationBounds(self, i: cint, som: cdouble):
-        """Cumulative weights bracketing the segment between centroid i and i+1.
+    def _findSegment(self, k: cdouble) -> cint:
+        """Index of the segment of the ladder that holds k.
 
-        We use the approach of Dunning here to improve interpolation when we have
-        single weighted points: a centroid carrying a weight of one sits at an
-        exact observation, so the segment interpolates from the centroid itself
-        rather than from its midpoint.
+        Callers guarantee lower() <= k < upper(), so there is a segment to
+        find. The centroids are sorted, so it is the last one at or below k,
+        located by the same binary search quantile() uses on the rungs
+        rather than by a scan, which is what keeps a query on a fitted
+        digest cheap.
 
         Args:
-            i (int): Index of the left centroid of the segment.
-            som (float): Total weight of all centroids before i.
+            k (float): The value to locate, within the support.
 
         Returns:
-            tuple: (yi, yi_n), the cumulative weights at c[i] and c[i+1].
+            int: Index of the left centroid of the segment holding k.
         """
-        m = self._cnts
+        lo: cint = 0
+        hi: cint = self.nActive - 1
+        mid: cint
 
-        if (m[i] > 1) & (m[i+1] > 1):
-            # Case I: Both points greater than one, normal interpolation.
-            yi   = som + m[i]/2
-            yi_n = yi + (m[i+1] + m[i]) / 2
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
 
-        elif (m[i] == 1) & (m[i+1] > 1):
-            # Case II: Left point is a single observation.
-            yi   = som
-            yi_n = yi + (m[i+1]) / 2
+            if self._bins[mid] <= k:
+                lo = mid
+            else:
+                hi = mid - 1
 
-        elif (m[i] > 1) & (m[i+1] == 1):
-            # Case III: Right point is a single observation.
-            yi   = som + m[i]/2
-            yi_n = yi + (m[i]) / 2
-        else:
-            # Case IV: Both are single observations, nothing to interpolate over.
-            yi   = som
-            yi_n = yi
-
-        return yi, yi_n
+        return lo
 
     @cfunc
     @boundscheck(False)
@@ -469,10 +466,16 @@ class RanVar():
     def cdf(self, k):
         """Compute the cumulative distribution function at a given point.
 
-        Implements the CDF estimation algorithm from Ted Dunning's paper
-        'Computing Extremely Accurate Quantiles Using t-Digests'. Uses
-        different interpolation strategies depending on whether centroids
-        represent single points or aggregated ranges.
+        Reads the same cumulative weight ladder quantile() walks, so the two
+        describe one distribution rather than two: rung i is the cumulative
+        weight at centroid i, gap i is the weight the segment from centroid
+        i to i+1 spans, and the curve rises linearly across each segment
+        between them. cdf() is therefore quantile()'s exact inverse, and the
+        density dcdf() reads is that same curve's gradient.
+
+        The curve is continuous: it leaves the bottom centroid at 0, reaches
+        the top one at 1, and every segment ends where the next begins, so
+        there is no mass sitting on any single point.
 
         Args:
             k (float): The point at which to evaluate the CDF.
@@ -480,31 +483,21 @@ class RanVar():
         Returns:
             float: Estimated CDF value between 0 and 1.
         """
-        som:cdouble = 0
         i:cint
-
-        c = self._bins
-        m = self._cnts
-
 
         if k <= self._lower():
             return 0.
         elif k >= self._upper():
             return 1.
-        else:
-            for i in range(self.nActive):
-                if c[i] <= k < c[i+1]:
-                    yi, yi_n = self._interpolationBounds(i, som)
 
-                    g    = (yi_n - yi) / (c[i+1] - c[i])
-                    yk   = g*(k - c[i]) + yi
+        if self._stale:
+            self._rebuildLadder()
 
-                    return yk / self._sumWeights()
+        c = self._bins
+        i = self._findSegment(k)
 
-                else:
-                    som += m[i]
-        
-        pass
+        return (self._cumw[i]
+                + self._gaps[i]*(k - c[i])/(c[i+1] - c[i])) / self._total
 
     def ccdf(self, x):
         """Compute the complementary cumulative distribution function at a point.
@@ -523,12 +516,12 @@ class RanVar():
     def _integral(self, a: cdouble, b: cdouble, complement: cint) -> cdouble:
         """Area under the CDF, or under the CCDF, between two points.
 
-        Both curves are the same piecewise-linear read of the centroids that
-        cdf() takes, so both integrals are the same walk over the segments
-        between adjacent centroids. Over a segment the curve is a straight
-        line, so its area is exactly the width of the overlap with [a, b]
-        times the height at the middle of that overlap, with no quadrature
-        error to control.
+        Both curves are read off the cumulative weight ladder that cdf() and
+        quantile() share, so both integrals are the same walk over the
+        segments between adjacent centroids. Over a segment the curve is a
+        straight line, so its area is exactly the width of the overlap with
+        [a, b] times the height at the middle of that overlap, with no
+        quadrature error to control.
 
         Outside the support the curve is flat: the CDF is 0 below the
         smallest centroid and 1 above the largest, the CCDF the other way
@@ -537,12 +530,10 @@ class RanVar():
         so a=-inf for the CDF and b=+inf for the CCDF are answered rather
         than refused.
 
-        The interpolated curve jumps at a centroid where a neighbouring
-        weight is one (cdf() reads the segment the point falls in, and the
-        two segments need not agree at the centroid between them), and it
-        jumps again at each end of the support. Those are finitely many
-        points and so carry no area, which is why this still integrates the
-        same function cdf() evaluates.
+        The curve is continuous, and it meets 0 and 1 exactly at the two
+        ends of the support, so the segment walk joins the flat tails
+        without a seam and no mass sits on a single point for the area to
+        miss.
 
         Args:
             a (float): Lower limit, may be -inf.
@@ -556,12 +547,10 @@ class RanVar():
         Raises:
             ValueError: If the digest is empty, or a limit is NaN.
         """
-        som: cdouble = 0
         area: cdouble = 0
         i: cint
 
         c = self._bins
-        m = self._cnts
 
         # Refuses an empty digest before anything indexes the centroids.
         lo: cdouble = self._lower()
@@ -577,7 +566,10 @@ class RanVar():
         if b < a:
             return -self._integral(b, a, complement)
 
-        W: cdouble = self._sumWeights()
+        if self._stale:
+            self._rebuildLadder()
+
+        W: cdouble = self._total
 
         # The flat tail the curve is 1 over. The other tail is 0 there and
         # contributes nothing, which is what keeps the opposite limit from
@@ -594,20 +586,15 @@ class RanVar():
             v: cdouble = b if b < c[i+1] else c[i+1]
 
             if v > u:
-                yi, yi_n = self._interpolationBounds(i, som)
-
-                g  = (yi_n - yi) / (c[i+1] - c[i])
-
                 # A straight line averages to its height at the midpoint, so
                 # this is the mean of the curve over [u, v] exactly.
-                yk = g*((u + v)/2 - c[i]) + yi
+                yk: cdouble = (self._cumw[i]
+                               + self._gaps[i]*((u + v)/2 - c[i])/(c[i+1] - c[i]))
 
                 if complement:
                     area = area + (v - u) * (W - yk) / W
                 else:
                     area = area + (v - u) * yk / W
-
-            som += m[i]
 
         return area
 
@@ -667,10 +654,12 @@ class RanVar():
     def dcdf(self, k):
         """Compute the derivative of the CDF at a given point.
 
-        The CDF is piecewise linear between centroids, so its derivative is the
-        constant gradient of the segment containing k, normalised by the total
-        weight. This is the density estimate at k. Outside the support the CDF is
-        flat, so the derivative is zero.
+        The CDF is piecewise linear between centroids, so its derivative is
+        the constant gradient of the segment containing k: the weight that
+        segment spans, over its width and the total weight. This is the
+        density estimate at k, and it is read off the same ladder cdf() and
+        quantile() use. Outside the support the CDF is flat, so the
+        derivative is zero.
 
         Args:
             k (float): The point at which to evaluate the derivative.
@@ -678,27 +667,18 @@ class RanVar():
         Returns:
             float: Estimated density at k.
         """
-        som:cdouble = 0
         i:cint
-
-        c = self._bins
-        m = self._cnts
 
         if (k <= self._lower()) or (k >= self._upper()):
             return 0.
 
-        for i in range(self.nActive - 1):
-            if c[i] <= k < c[i+1]:
-                yi, yi_n = self._interpolationBounds(i, som)
+        if self._stale:
+            self._rebuildLadder()
 
-                g = (yi_n - yi) / (c[i+1] - c[i])
+        c = self._bins
+        i = self._findSegment(k)
 
-                return g / self._sumWeights()
-
-            else:
-                som += m[i]
-
-        return 0.
+        return self._gaps[i] / ((c[i+1] - c[i]) * self._total)
 
     def dccdf(self, k):
         """Compute the derivative of the complementary CDF at a given point.
