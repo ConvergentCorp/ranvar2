@@ -57,8 +57,9 @@ class RanVar():
 
     cdf(), dcdf() and the two integrals read that same ladder, so every view
     of the digest describes one distribution: the piecewise-linear curve
-    through the rungs. cdf() is quantile()'s exact inverse, dcdf()/dccdf()
-    are that curve's gradient, and icdf()/iccdf() are the areas under it.
+    through the rungs. cdf() is quantile()'s exact inverse, dcdf() is that
+    curve's gradient, and cdfIntegral()/ccdfIntegral() are the areas under
+    it.
 
     Attributes:
         bins (np.ndarray): Array storing centroid values (x-coordinates)
@@ -597,13 +598,8 @@ class RanVar():
 
         return area
 
-    def icdf(self, a, b):
+    def cdfIntegral(self, a, b):
         """Integrate the CDF between two points.
-
-        The i is for integral, matching dcdf() for the derivative. It is not
-        the inverse CDF, which some libraries spell this way: the inverse of
-        cdf() is quantile(), and it takes one probability rather than two
-        limits.
 
         Computed from the centroids and weights themselves rather than by
         quadrature: the interpolated CDF is piecewise linear, so each
@@ -626,23 +622,20 @@ class RanVar():
         Example:
             >>> x = RanVar(maxBins=32)
             >>> x.fit([1, 2, 3, 4, 5])
-            >>> x.icdf(x.lower(), x.upper())  # area under the CDF
+            >>> x.cdfIntegral(x.lower(), x.upper())  # area under the CDF
             1.2000000000000002
         """
         return self._integral(a, b, 0)
 
-    def iccdf(self, a, b):
+    def ccdfIntegral(self, a, b):
         """Integrate the complementary CDF between two points.
 
-        The i is for integral, as in icdf(), and dccdf() is the derivative
-        of the same curve.
-
-        The counterpart of icdf(), computed the same exact way rather
-        than as (b - a) - icdf(a, b), which would cancel two large
+        The counterpart of cdfIntegral(), computed the same exact way rather
+        than as (b - a) - cdfIntegral(a, b), which would cancel two large
         numbers against each other once b runs far past the support.
 
         The CCDF is 0 above the support, so b may be +inf and the answer is
-        still finite: iccdf(lower(), inf) is the mean measured from
+        still finite: ccdfIntegral(lower(), inf) is the mean measured from
         the bottom of the support. It is 1 below the support, so a=-inf is
         +inf.
 
@@ -1366,7 +1359,7 @@ class Normal(RanVar):
         return 0.5 * cerfc(z)
 
 
-    def icdf(self, a, b):
+    def cdfIntegral(self, a, b):
         """Integrate the CDF of Normal(mean, std) between two points.
 
         Closed form, like cdf() itself: (x - mean)*cdf(x) + std^2*dcdf(x)
@@ -1395,7 +1388,7 @@ class Normal(RanVar):
             return 0.
 
         if b < a:
-            return -self.icdf(b, a)
+            return -self.cdfIntegral(b, a)
 
         if b == float('inf'):
             return float('inf')
@@ -1408,17 +1401,17 @@ class Normal(RanVar):
 
         return v - u
 
-    def iccdf(self, a, b):
+    def ccdfIntegral(self, a, b):
         """Integrate the complementary CDF of Normal(mean, std) between two
         points.
 
-        The counterpart of icdf(), with (x - mean)*ccdf(x) -
+        The counterpart of cdfIntegral(), with (x - mean)*ccdf(x) -
         std^2*dcdf(x) as the antiderivative. Written in terms of ccdf()
-        rather than as (b - a) - icdf(a, b), which would lose the
+        rather than as (b - a) - cdfIntegral(a, b), which would lose the
         answer to cancellation far into the upper tail, where the same
         ccdf() is still accurate.
 
-        b may be +inf: iccdf(mean, inf) is the mean absolute deviation
+        b may be +inf: ccdfIntegral(mean, inf) is the mean absolute deviation
         of the upper half. a=-inf is +inf, since the CCDF tends to 1 there.
 
         Args:
@@ -1438,7 +1431,7 @@ class Normal(RanVar):
             return 0.
 
         if b < a:
-            return -self.iccdf(b, a)
+            return -self.ccdfIntegral(b, a)
 
         if a == float('-inf'):
             return float('inf')
@@ -1803,7 +1796,7 @@ class NegBinom(RanVar):
         )
 
 
-    def icdf(self, a, b):
+    def cdfIntegral(self, a, b):
         """Not implemented, for the same reason as cdf().
 
         The integral of a step function is a sum of its steps, so it needs
@@ -1814,18 +1807,18 @@ class NegBinom(RanVar):
             NotImplementedError: Always.
         """
         raise NotImplementedError(
-            'NegBinom.icdf() has no closed form using only standard '
+            'NegBinom.cdfIntegral() has no closed form using only standard '
             'C math functions, for the same reason as NegBinom.cdf().'
         )
 
-    def iccdf(self, a, b):
-        """Not implemented, for the same reason as icdf().
+    def ccdfIntegral(self, a, b):
+        """Not implemented, for the same reason as cdfIntegral().
 
         Raises:
             NotImplementedError: Always.
         """
         raise NotImplementedError(
-            'NegBinom.iccdf() has no closed form using only standard '
+            'NegBinom.ccdfIntegral() has no closed form using only standard '
             'C math functions, for the same reason as NegBinom.cdf().'
         )
 
@@ -2066,7 +2059,7 @@ class Constant(RanVar):
         return 1.0 if x < self._value else 0.0
 
 
-    def icdf(self, a, b):
+    def cdfIntegral(self, a, b):
         """Integrate the CDF of the degenerate distribution between two
         points.
 
@@ -2091,17 +2084,17 @@ class Constant(RanVar):
             return 0.
 
         if b < a:
-            return -self.icdf(b, a)
+            return -self.cdfIntegral(b, a)
 
         u: cdouble = a if a > self._value else self._value
 
         return b - u if b > u else 0.
 
-    def iccdf(self, a, b):
+    def ccdfIntegral(self, a, b):
         """Integrate the complementary CDF of the degenerate distribution
         between two points.
 
-        The mirror of icdf(): the CCDF steps the other way, so this
+        The mirror of cdfIntegral(): the CCDF steps the other way, so this
         is the length of whatever part of [a, b] lies below the value.
 
         Args:
@@ -2121,7 +2114,7 @@ class Constant(RanVar):
             return 0.
 
         if b < a:
-            return -self.iccdf(b, a)
+            return -self.ccdfIntegral(b, a)
 
         v: cdouble = b if b < self._value else self._value
 

@@ -356,8 +356,8 @@ def test_empty_digest_raises():
         ('ccdf()',         lambda: x.ccdf(5.0)),
         ('dcdf()',         lambda: x.dcdf(5.0)),
         ('dccdf()',        lambda: x.dccdf(5.0)),
-        ('icdf()',  lambda: x.icdf(1.0, 5.0)),
-        ('iccdf()', lambda: x.iccdf(1.0, 5.0)),
+        ('cdfIntegral()',  lambda: x.cdfIntegral(1.0, 5.0)),
+        ('ccdfIntegral()', lambda: x.ccdfIntegral(1.0, 5.0)),
         ('quantile(0.0)',  lambda: x.quantile(0.0)),
         ('quantile(0.5)',  lambda: x.quantile(0.5)),
         ('quantile(1.0)',  lambda: x.quantile(1.0)),
@@ -465,7 +465,7 @@ def test_ladder_is_rebuilt_after_pickle_and_copy():
             assert y.quantile(p) == x.quantile(p), f'restored digest differs at p={p}'
 
 
-# icdf()/iccdf(): the areas under the two curves, read off the
+# cdfIntegral()/ccdfIntegral(): the areas under the two curves, read off the
 # centroids and weights rather than integrated numerically. Each is checked
 # against a midpoint rule over the very function it claims to integrate,
 # which assumes nothing about the shape of that function. ------------------
@@ -541,30 +541,30 @@ def _unitDigest():
     return x
 
 
-def test_icdf_matches_a_numerical_integral():
-    """Tests icdf() against a midpoint rule over cdf() itself, on
+def test_cdfIntegral_matches_a_numerical_integral():
+    """Tests cdfIntegral() against a midpoint rule over cdf() itself, on
     digests covering all four interpolation cases.
     """
     for build in (_fittedDigest, _weightedDigest, _twoCentroidDigest, _unitDigest):
         x = build()
 
         for a, b in _integralWindows(x):
-            exact     = x.icdf(a, b)
+            exact     = x.cdfIntegral(a, b)
             numerical = _midpointIntegral(x.cdf, a, b)
 
             assert abs(exact - numerical) <= 1e-5*(b - a) + 1e-9, \
                 f'{build.__name__} cdf over [{a}, {b}]: {exact} vs {numerical}'
 
 
-def test_iccdf_matches_a_numerical_integral():
-    """Tests iccdf() the same way, against a midpoint rule over
+def test_ccdfIntegral_matches_a_numerical_integral():
+    """Tests ccdfIntegral() the same way, against a midpoint rule over
     ccdf().
     """
     for build in (_fittedDigest, _weightedDigest, _twoCentroidDigest, _unitDigest):
         x = build()
 
         for a, b in _integralWindows(x):
-            exact     = x.iccdf(a, b)
+            exact     = x.ccdfIntegral(a, b)
             numerical = _midpointIntegral(x.ccdf, a, b)
 
             assert abs(exact - numerical) <= 1e-5*(b - a) + 1e-9, \
@@ -578,7 +578,7 @@ def test_integrals_of_the_two_curves_add_up_to_the_width():
     x = _fittedDigest()
 
     for a, b in _integralWindows(x):
-        total = x.icdf(a, b) + x.iccdf(a, b)
+        total = x.cdfIntegral(a, b) + x.ccdfIntegral(a, b)
 
         assert abs(total - (b - a)) <= 1e-9*(b - a)
 
@@ -594,10 +594,10 @@ def test_integrals_are_additive_over_adjacent_windows():
     for m in (lo, 1.0, 2.5, 3.3, 7.0, hi, hi + 1.0):
         a, b = lo - 2.0, hi + 2.0
 
-        assert x.icdf(a, b) == pytest.approx(
-            x.icdf(a, m) + x.icdf(m, b), abs=1e-12)
-        assert x.iccdf(a, b) == pytest.approx(
-            x.iccdf(a, m) + x.iccdf(m, b), abs=1e-12)
+        assert x.cdfIntegral(a, b) == pytest.approx(
+            x.cdfIntegral(a, m) + x.cdfIntegral(m, b), abs=1e-12)
+        assert x.ccdfIntegral(a, b) == pytest.approx(
+            x.ccdfIntegral(a, m) + x.ccdfIntegral(m, b), abs=1e-12)
 
 
 def test_integrals_of_an_empty_window_and_reversed_limits():
@@ -606,11 +606,11 @@ def test_integrals_of_an_empty_window_and_reversed_limits():
     """
     x = _weightedDigest()
 
-    assert x.icdf(3.0, 3.0)  == 0.0
-    assert x.iccdf(3.0, 3.0) == 0.0
+    assert x.cdfIntegral(3.0, 3.0)  == 0.0
+    assert x.ccdfIntegral(3.0, 3.0) == 0.0
 
-    assert x.icdf(6.0, 2.0)  == -x.icdf(2.0, 6.0)
-    assert x.iccdf(6.0, 2.0) == -x.iccdf(2.0, 6.0)
+    assert x.cdfIntegral(6.0, 2.0)  == -x.cdfIntegral(2.0, 6.0)
+    assert x.ccdfIntegral(6.0, 2.0) == -x.ccdfIntegral(2.0, 6.0)
 
 
 def test_integrals_outside_the_support_are_flat():
@@ -621,11 +621,11 @@ def test_integrals_outside_the_support_are_flat():
 
     lo, hi = x.lower(), x.upper()
 
-    assert x.icdf(lo - 7.0, lo)  == 0.0
-    assert x.iccdf(hi, hi + 7.0) == 0.0
+    assert x.cdfIntegral(lo - 7.0, lo)  == 0.0
+    assert x.ccdfIntegral(hi, hi + 7.0) == 0.0
 
-    assert x.icdf(hi, hi + 7.0) == pytest.approx(7.0)
-    assert x.iccdf(lo - 7.0, lo) == pytest.approx(7.0)
+    assert x.cdfIntegral(hi, hi + 7.0) == pytest.approx(7.0)
+    assert x.ccdfIntegral(lo - 7.0, lo) == pytest.approx(7.0)
 
 
 def test_integrals_accept_the_unbounded_side():
@@ -640,11 +640,11 @@ def test_integrals_accept_the_unbounded_side():
 
     # Far enough out that nothing is left to accumulate, so the infinite
     # limit has to agree with it.
-    assert x.icdf(float('-inf'), hi) == pytest.approx(x.icdf(lo - 1e3*span, hi))
-    assert x.iccdf(lo, float('inf')) == pytest.approx(x.iccdf(lo, hi + 1e3*span))
+    assert x.cdfIntegral(float('-inf'), hi) == pytest.approx(x.cdfIntegral(lo - 1e3*span, hi))
+    assert x.ccdfIntegral(lo, float('inf')) == pytest.approx(x.ccdfIntegral(lo, hi + 1e3*span))
 
-    assert x.icdf(lo, float('inf'))  == float('inf')
-    assert x.iccdf(float('-inf'), hi) == float('inf')
+    assert x.cdfIntegral(lo, float('inf'))  == float('inf')
+    assert x.ccdfIntegral(float('-inf'), hi) == float('inf')
 
 
 def _interpolatedMean(x):
@@ -702,7 +702,7 @@ def test_integrals_of_the_ccdf_give_the_mean_of_the_interpolated_curve(build):
 
     lo = x.lower()
 
-    assert lo + x.iccdf(lo, float('inf')) == pytest.approx(
+    assert lo + x.ccdfIntegral(lo, float('inf')) == pytest.approx(
         _interpolatedMean(x), rel=1e-12)
 
 
@@ -712,10 +712,10 @@ def test_integrals_reject_nan_limits():
 
     nan = float('nan')
 
-    for call in (lambda: x.icdf(nan, 1.0),
-                 lambda: x.icdf(1.0, nan),
-                 lambda: x.iccdf(nan, 1.0),
-                 lambda: x.iccdf(1.0, nan)):
+    for call in (lambda: x.cdfIntegral(nan, 1.0),
+                 lambda: x.cdfIntegral(1.0, nan),
+                 lambda: x.ccdfIntegral(nan, 1.0),
+                 lambda: x.ccdfIntegral(1.0, nan)):
         try:
             call()
         except ValueError:
@@ -732,14 +732,14 @@ def test_integrals_of_a_single_centroid_digest():
     x = mc.Digest(maxBins=32)
     x.add(4.0, 3.0)
 
-    assert x.icdf(0.0, 10.0)  == pytest.approx(6.0)
-    assert x.iccdf(0.0, 10.0) == pytest.approx(4.0)
+    assert x.cdfIntegral(0.0, 10.0)  == pytest.approx(6.0)
+    assert x.ccdfIntegral(0.0, 10.0) == pytest.approx(4.0)
 
-    assert x.icdf(0.0, 10.0)  == pytest.approx(_midpointIntegral(x.cdf, 0.0, 10.0),  abs=1e-4)
-    assert x.iccdf(0.0, 10.0) == pytest.approx(_midpointIntegral(x.ccdf, 0.0, 10.0), abs=1e-4)
+    assert x.cdfIntegral(0.0, 10.0)  == pytest.approx(_midpointIntegral(x.cdf, 0.0, 10.0),  abs=1e-4)
+    assert x.ccdfIntegral(0.0, 10.0) == pytest.approx(_midpointIntegral(x.ccdf, 0.0, 10.0), abs=1e-4)
 
-    assert x.icdf(float('-inf'), 4.0) == 0.0
-    assert x.iccdf(4.0, float('inf')) == 0.0
+    assert x.cdfIntegral(float('-inf'), 4.0) == 0.0
+    assert x.ccdfIntegral(4.0, float('inf')) == 0.0
 
 
 # The two extreme centroids, where a weight of one means the interpolation
@@ -789,9 +789,9 @@ def test_integrals_with_singleton_endpoints(name, spec):
     ]
 
     for a, b in windows:
-        assert x.icdf(a, b) == pytest.approx(
+        assert x.cdfIntegral(a, b) == pytest.approx(
             _midpointIntegral(x.cdf, a, b), abs=1e-4), f'{name} cdf over [{a}, {b}]'
-        assert x.iccdf(a, b) == pytest.approx(
+        assert x.ccdfIntegral(a, b) == pytest.approx(
             _midpointIntegral(x.ccdf, a, b), abs=1e-4), f'{name} ccdf over [{a}, {b}]'
 
 
@@ -811,17 +811,17 @@ def test_integrals_continue_flat_past_a_singleton_endpoint(name, spec):
     lo, hi = x.lower(), x.upper()
 
     for d in (1e-6, 0.25, 4.0):
-        assert x.icdf(lo, hi + d) == pytest.approx(
-            x.icdf(lo, hi) + d, abs=1e-12)
-        assert x.iccdf(lo - d, hi) == pytest.approx(
-            x.iccdf(lo, hi) + d, abs=1e-12)
+        assert x.cdfIntegral(lo, hi + d) == pytest.approx(
+            x.cdfIntegral(lo, hi) + d, abs=1e-12)
+        assert x.ccdfIntegral(lo - d, hi) == pytest.approx(
+            x.ccdfIntegral(lo, hi) + d, abs=1e-12)
 
         # And from the other side: a window wholly outside the support is
         # all of one curve and none of the other.
-        assert x.icdf(hi, hi + d)  == pytest.approx(d, abs=1e-12)
-        assert x.iccdf(lo - d, lo) == pytest.approx(d, abs=1e-12)
-        assert x.icdf(lo - d, lo)  == 0.0
-        assert x.iccdf(hi, hi + d) == 0.0
+        assert x.cdfIntegral(hi, hi + d)  == pytest.approx(d, abs=1e-12)
+        assert x.ccdfIntegral(lo - d, lo) == pytest.approx(d, abs=1e-12)
+        assert x.cdfIntegral(lo - d, lo)  == 0.0
+        assert x.ccdfIntegral(hi, hi + d) == 0.0
 
 
 @pytest.mark.parametrize('name, spec', ENDPOINT_WEIGHTS)
@@ -836,12 +836,12 @@ def test_integrals_split_exactly_on_the_endpoints(name, spec):
     a, b   = lo - 2.0, hi + 2.0
 
     for m in (lo, hi):
-        assert x.icdf(a, b) == pytest.approx(
-            x.icdf(a, m) + x.icdf(m, b), abs=1e-12)
-        assert x.iccdf(a, b) == pytest.approx(
-            x.iccdf(a, m) + x.iccdf(m, b), abs=1e-12)
+        assert x.cdfIntegral(a, b) == pytest.approx(
+            x.cdfIntegral(a, m) + x.cdfIntegral(m, b), abs=1e-12)
+        assert x.ccdfIntegral(a, b) == pytest.approx(
+            x.ccdfIntegral(a, m) + x.ccdfIntegral(m, b), abs=1e-12)
 
-    assert x.icdf(a, b) + x.iccdf(a, b) == pytest.approx(b - a)
+    assert x.cdfIntegral(a, b) + x.ccdfIntegral(a, b) == pytest.approx(b - a)
 
 
 @pytest.mark.parametrize('name, spec', ENDPOINT_WEIGHTS)
@@ -892,7 +892,7 @@ def test_singleton_endpoints_carry_their_mass_into_the_area(name, spec):
 
     lo = x.lower()
 
-    assert lo + x.iccdf(lo, float('inf')) == pytest.approx(
+    assert lo + x.ccdfIntegral(lo, float('inf')) == pytest.approx(
         _interpolatedMean(x), rel=1e-12)
 
 
@@ -903,7 +903,7 @@ def test_a_single_centroid_carries_its_mass_into_the_area():
     x = mc.Digest(maxBins=32)
     x.add(4.0, 3.0)
 
-    assert x.lower() + x.iccdf(x.lower(), float('inf')) == pytest.approx(
+    assert x.lower() + x.ccdfIntegral(x.lower(), float('inf')) == pytest.approx(
         _interpolatedMean(x), rel=1e-12)
 
 
